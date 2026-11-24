@@ -23,9 +23,9 @@ See [general_search_platform_schema.sql](../backend/sql/general_search_platform_
 - BrochureIQ tables: `dbo.Brochures`.
 - Retired legacy Catalog Thresholds tables: `searchai.SearchAISettings`, `searchai.SearchAISettingsHistory` (retired per Decision #1; left intact in staging SQL Server and never dropped or queried by `Search_Admin`).
 
-## 3. Isolated Admin Authentication Store
+## 3. Authentication Storage (None Owned by Search Admin)
 
-`backend/app/db/auth_db.py` stores `admin_sessions` and `admin_login_attempts` in a dedicated local SQLite file (`SEARCH_ADMIN_AUTH_DB_PATH`, default `./data/admin_auth.db`). It is completely separate from the SQL Server platform database and uses the dedicated cookie name `bonc_search_admin_platform_session` so no loopback cookie collisions can occur with legacy `py-backend`.
+Search Admin authenticates all administrators statelessly through BONC JWT verification against BONC's `.NET` `getUserDetail` endpoint (`BONC_AUTH_VERIFY_URL`). Search Admin does **not** maintain any local user, password, session, or login-attempt database tables. *(Historical legacy SQL Server tables from earlier migrations, if still present in staging, are never accessed or modified by Search Admin.)*
 
 ## 4. Database Cutover Rules (Preventing Dual Writers)
 
@@ -35,6 +35,6 @@ Because the legacy split Search AI microservice (`py-backend/app/search_main.py`
 2. **During cutover to staging**:
    - Stop and disable the legacy port-`8002` `search_main.py` service so it can no longer mutate `searchai.*` rows or hold stale in-memory FAISS caches.
    - Verify all 6 `searchai.*` tables exist and match `general_search_platform_schema.sql` (including `SearchCategoryHistory.RolledBackFromVersion`).
-   - Configure `SEARCH_PLATFORM_SQL_ODBC_CONNECT_STAGING` and any `SEARCH_SOURCE_*` read-only profiles in `/etc/bonc-search-admin/backend.env`.
+   - Configure `SEARCH_PLATFORM_SQL_ODBC_CONNECT_STAGING`, `BONC_AUTH_VERIFY_URL`, and any `SEARCH_SOURCE_*` read-only profiles in `/etc/bonc-search-admin/backend.env`.
    - Start `bonc-search-admin-backend.service` (`WEB_CONCURRENCY=1`) and verify `/health/live`, `/health/ready`, and `/api/admin/platform/system-health`.
 3. **Production**: Keep `PRODUCTION_OBSERVABILITY_ENABLED=false` until Stage 3 VPS deployment verification, network path review, and upstream authentication sign-off are complete.

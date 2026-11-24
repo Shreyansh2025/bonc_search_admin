@@ -602,9 +602,15 @@ describe("Search Admin Engine Testing dropdown switching & async race protection
       }
     };
 
+    const flushMicrotasks = async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    };
+
     // 1. Start a slow search on general_test
     const slowGeneralPromise = runSearch("general_test", "fastapi");
     assert.equal(activeState.searching, true);
+    await flushMicrotasks();
     assert.equal(signalsByCategory.get("general_test")?.aborted, false);
 
     // 2. While general_test is still pending, user switches dropdown to people
@@ -617,6 +623,7 @@ describe("Search Admin Engine Testing dropdown switching & async race protection
     // 3. User runs a fast search on people and it completes first
     const fastPeoplePromise = runSearch("people", "fastapi");
     assert.equal(activeState.searching, true);
+    await flushMicrotasks();
     deferredByCategory.get("people")!.resolve(
       new Response(JSON.stringify(makeSearchResponse(byId.get("people")!, "fastapi")), {
         status: 200,
@@ -647,12 +654,14 @@ describe("Search Admin Engine Testing dropdown switching & async race protection
     // 5. Repeat with a late FAILURE from people while articles is still in-flight:
     //    must neither flip searching=false early nor inject an error into articles!
     const slowPeopleFailPromise = runSearch("people", "backend");
+    await flushMicrotasks();
     coordinator.invalidate();
     coordinator.setActiveCategory("articles");
     activeState = transitionTestingEngine(activeState, "articles");
 
     const pendingArticlesPromise = runSearch("articles", "backend");
     assert.equal(activeState.searching, true);
+    await flushMicrotasks();
 
     deferredByCategory.get("people")!.reject(new Error("Upstream 500 on people"));
     await slowPeopleFailPromise;

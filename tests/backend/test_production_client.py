@@ -18,23 +18,47 @@ from app.clients.production_search_client import (  # noqa: E402
     ProductionSearchClient,
     filter_product_company_indexes,
 )
-from app.db import auth_db, platform_db  # noqa: E402
+from app.db import platform_db  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.services import admin_auth, bonc_auth  # noqa: E402
+
+
+class _ProdRouteTestBoncVerifier(bonc_auth.BoncTokenVerifier):
+    def is_configured(self) -> bool:
+        return True
+
+    def verify_access_token(self, raw_token: str) -> bonc_auth.VerifiedBoncIdentity:
+        if raw_token != "prod-route-test-token":
+            raise bonc_auth.BoncTokenInvalidError("Invalid token")
+        return bonc_auth.VerifiedBoncIdentity(
+            user_id="admin-prod-obs",
+            username="admin-prod-obs",
+            expires_at_utc=None,
+            roles=("Admin",),
+        )
 
 
 class TestProductionSearchClient(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_env = dict(os.environ)
-        os.environ["SEARCH_ADMIN_AUTH_DB_URL"] = "sqlite:///:memory:"
-        os.environ["SEARCH_ADMIN_SERVICE_TOKEN"] = "prod-route-test-token"
+        os.environ["APP_ENV"] = "local"
         os.environ["PRODUCTION_OBSERVABILITY_ENABLED"] = "false"
         os.environ["SEARCH_PLATFORM_WARMUP_EMBEDDING_MODEL"] = "false"
-        auth_db.reset_auth_engine()
+        admin_auth.reset_auth_provider()
+        admin_auth.set_auth_provider(
+            bonc_auth.BoncJwtAuthProvider(
+                verifier=_ProdRouteTestBoncVerifier(),
+                claims_config=bonc_auth.BoncClaimsValidationConfig.delegated_server_verification(),
+                role_policy=bonc_auth.BoncRoleAuthorizationPolicy(
+                    allowed_admin_roles=frozenset({"Admin", "SuperAdmin"})
+                ),
+            )
+        )
         platform_db.reset_platform_engine()
         platform_db.set_platform_engine(platform_db.create_in_memory_sqlite_platform_engine())
 
     def tearDown(self) -> None:
-        auth_db.reset_auth_engine()
+        admin_auth.reset_auth_provider()
         platform_db.reset_platform_engine()
         os.environ.clear()
         os.environ.update(self._orig_env)

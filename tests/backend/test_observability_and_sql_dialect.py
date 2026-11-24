@@ -16,10 +16,29 @@ BACKEND_DIR = Path(__file__).resolve().parents[2] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.db import auth_db, platform_db  # noqa: E402
+from app.db import platform_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.repositories import category_store, observability_store  # noqa: E402
-from app.services import embedding_model, platform_search  # noqa: E402
+from app.services import admin_auth, bonc_auth, embedding_model, platform_search  # noqa: E402
+
+
+class _ObsTestBoncVerifier(bonc_auth.BoncTokenVerifier):
+    def __init__(self, expected_token: str, actor: str = "admin:obs") -> None:
+        self._expected_token = expected_token
+        self._actor = actor
+
+    def is_configured(self) -> bool:
+        return True
+
+    def verify_access_token(self, raw_token: str) -> bonc_auth.VerifiedBoncIdentity:
+        if raw_token != self._expected_token:
+            raise bonc_auth.BoncTokenInvalidError("Invalid test BONC token")
+        return bonc_auth.VerifiedBoncIdentity(
+            user_id=self._actor,
+            username=self._actor,
+            expires_at_utc=None,
+            roles=("Admin",),
+        )
 
 
 class _TinyModel:
@@ -32,14 +51,21 @@ class _TinyModel:
 class TestObservabilityAndSqlDialect(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_env = dict(os.environ)
-        os.environ["SEARCH_ADMIN_AUTH_DB_URL"] = "sqlite:///:memory:"
-        os.environ["SEARCH_ADMIN_SERVICE_TOKEN"] = "obs-secret-token-xyz987"
-        os.environ["SEARCH_ADMIN_SERVICE_ACTOR"] = "admin:obs"
+        os.environ["APP_ENV"] = "local"
         os.environ["PRODUCTION_OBSERVABILITY_ENABLED"] = "false"
         os.environ["SEARCH_PLATFORM_WARMUP_EMBEDDING_MODEL"] = "false"
-        self.headers = {"Authorization": "Bearer obs-secret-token-xyz987"}
+        self.headers = {"Authorization": "Bearer obs-bonc-test-token-xyz987"}
 
-        auth_db.reset_auth_engine()
+        admin_auth.reset_auth_provider()
+        admin_auth.set_auth_provider(
+            bonc_auth.BoncJwtAuthProvider(
+                verifier=_ObsTestBoncVerifier("obs-bonc-test-token-xyz987", "admin:obs"),
+                claims_config=bonc_auth.BoncClaimsValidationConfig.delegated_server_verification(),
+                role_policy=bonc_auth.BoncRoleAuthorizationPolicy(
+                    allowed_admin_roles=frozenset({"Admin", "SuperAdmin"})
+                ),
+            )
+        )
         platform_db.reset_platform_engine()
         platform_search.clear_all_category_indexes()
         platform_db.set_platform_engine(platform_db.create_in_memory_sqlite_platform_engine())
@@ -51,8 +77,8 @@ class TestObservabilityAndSqlDialect(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._model_patch.stop()
+        admin_auth.reset_auth_provider()
         platform_search.clear_all_category_indexes()
-        auth_db.reset_auth_engine()
         platform_db.reset_platform_engine()
         os.environ.clear()
         os.environ.update(self._orig_env)
@@ -205,12 +231,11 @@ class TestObservabilityAndSqlDialect(unittest.TestCase):
     def test_secret_redaction_scrubs_tokens_and_connection_strings(self) -> None:
         os.environ["PRODUCTION_SEARCH_AUTH_TOKEN"] = "prod-top-secret-99999"
         raw = (
-            "Error with obs-secret-token-xyz987 and prod-top-secret-99999 "
+            "Error with prod-top-secret-99999 "
             "Bearer abcdef123456 DRIVER={ODBC Driver 18};SERVER=s;UID=u;PWD=p "
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signature123456"
         )
         scrubbed = observability_store.redact_sensitive_text(raw)
-        self.assertNotIn("obs-secret-token-xyz987", scrubbed)
         self.assertNotIn("prod-top-secret-99999", scrubbed)
         self.assertNotIn("abcdef123456", scrubbed)
         self.assertNotIn("PWD=p", scrubbed)

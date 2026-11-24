@@ -7,8 +7,8 @@ export default defineConfig(({ mode }) => {
   const devPort = Number(env.VITE_PORT || 5175);
   const previewPort = Number(env.VITE_PREVIEW_PORT || 4175);
 
-  // Admin authentication uses backend-managed HttpOnly session cookies and CSRF
-  // protection. Never inject service tokens or credentials from the Vite proxy.
+  // Admin authentication uses BONC Bearer tokens (Authorization: Bearer <AuthToken>).
+  // Never inject tokens or credentials from the Vite proxy.
   const adminProxy: ProxyOptions = {
     target: adminBackendTarget,
     changeOrigin: true,

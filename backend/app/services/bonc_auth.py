@@ -1,35 +1,28 @@
-"""BONC authentication provider abstraction, strict token/claim validation, and role mapping.
+"""BONC JWT authentication provider, strict Bearer extraction, claim invariants, and RBAC.
 
 Design principles:
-- BONC is the single source of human user authentication. Search_Admin NEVER
-  generates, signs, or refreshes BONC tokens, and NEVER falls back to local
-  username/password authentication when BONC verification fails or is
-  unconfigured.
+- BONC is the ONLY supported Search Admin user authentication system.
+  Search_Admin never generates, signs, or refreshes BONC tokens, never offers
+  local username/password login, never accepts cookie sessions or unrelated
+  static/observability tokens, and has no authentication-disable bypass.
 - Authentication and authorization are strictly separated:
-  1. ``BoncTokenVerifier`` verifies the incoming Bearer token using BONC's
-     approved verification mechanism (e.g., JWKS/public-key verification,
-     verified symmetric key, or official server-side token introspection —
-     selected ONLY once the real BONC contract is confirmed).
-  2. ``validate_verified_bonc_identity`` enforces defense-in-depth claim
-     invariants (algorithm allowlist, ``alg != none``, ``iss``, ``aud``,
-     ``exp``, ``nbf``, optional ``kid`` / ``typ``, and required stable user ID).
-  3. ``BoncRoleAuthorizationPolicy`` maps verified BONC roles/permissions to
-     explicit Search_Admin capabilities and denies ordinary (non-Admin) BONC
-     users with HTTP 403.
-- Until BONC's verification contract and Admin role mapping are confirmed and
-  configured, ``BoncJwtAuthProvider`` remains disabled and fails closed with
-  HTTP 503.
+  1. ``BoncTokenVerifier`` verifies the incoming Bearer token via BONC's
+     authoritative ``getUserDetail`` endpoint (``BoncUserDetailVerifier``).
+  2. ``validate_verified_bonc_identity`` enforces identity invariants on the
+     verified result.
+  3. ``BoncRoleAuthorizationPolicy`` maps verified BONC admin roles to explicit
+     Search_Admin capabilities and denies non-Admin BONC users with HTTP 403.
+- Fails closed with HTTP 503 if ``BONC_AUTH_VERIFY_URL`` is unconfigured or if
+  BONC's endpoint is unreachable or returns an unexpected response.
 """
 from __future__ import annotations
 
-import base64
 import hmac
-import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Literal
+from typing import Callable, Literal
 
 from fastapi import HTTPException, Request
 
@@ -63,23 +56,13 @@ ALL_ADMIN_PERMISSIONS: frozenset[str] = frozenset(
     }
 )
 
-# Narrow permission boundary for optional backend-only CLI/automation scripts
-# (evaluation / read-only smoke checks) when explicitly enabled alongside BONC auth.
-CLI_AUTOMATION_ALLOWED_PERMISSIONS: frozenset[str] = frozenset(
-    {
-        ADMIN_PERMISSION_SEARCH_EXECUTE,
-        ADMIN_PERMISSION_CATEGORIES_READ,
-    }
-)
-
 _MAX_BEARER_TOKEN_LENGTH = 8192
 _MAX_CLOCK_SKEW_SECONDS = 60
 
-# Non-BONC secret env keys that must NEVER substitute for BONC human authentication.
+# Separate backend/observability secrets that must NEVER be accepted as BONC user tokens.
 _FORBIDDEN_NON_BONC_TOKEN_ENV_KEYS = (
-    "SEARCH_ADMIN_SERVICE_TOKEN",
-    "SEARCH_ADMIN_API_TOKEN",
     "PRODUCTION_SEARCH_AUTH_TOKEN",
+    "SEARCH_ADMIN_API_TOKEN",
     "SEARCH_INTERNAL_API_TOKEN",
 )
 
@@ -95,14 +78,12 @@ class AdminPrincipal:
 
     actor: str
     username: str
-    auth_method: Literal["session", "bearer", "jwt", "bonc_jwt"]
+    auth_method: Literal["bonc_jwt"] = "bonc_jwt"
     roles: tuple[str, ...] = ()
     session_id: str | None = None
     expires_at_utc: datetime | None = None
-    csrf_token: str | None = None
     user_id: str | None = None
     permissions: tuple[str, ...] = ()
-    is_service_account: bool = False
     token_id: str | None = None
 
 
@@ -117,7 +98,15 @@ def attach_request_principal(request: Request | None, principal: AdminPrincipal)
     request.state.admin_roles = principal.roles
     request.state.admin_permissions = principal.permissions
     request.state.admin_user_id = principal.user_id
-    request.state.admin_is_service_account = principal.is_service_account
+
+
+def _mark_request_auth_failed(request: Request | None) -> None:
+    """Record failed admin auth on ``request.state`` so observability logging never re-verifies."""
+    if request is None:
+        return
+    if getattr(request.state, "identity_type", None) not in {"authenticated", "anonymous", "session"}:
+        request.state.identity_type = "anonymous"
+        request.state.authenticated_user_id = None
 
 
 class AdminAuthProvider(ABC):
@@ -125,11 +114,7 @@ class AdminAuthProvider(ABC):
 
     @property
     def auth_mode(self) -> str:
-        return "custom"
-
-    def supports_local_login(self) -> bool:
-        """True only for local username/password session providers in local dev."""
-        return False
+        return "bonc_jwt"
 
     @abstractmethod
     def is_configured(self) -> bool:
@@ -141,7 +126,6 @@ class AdminAuthProvider(ABC):
         request: Request | None = None,
         *,
         authorization: str | None = None,
-        require_csrf: bool = True,
     ) -> AdminPrincipal:
         """Validate caller identity and return a trusted ``AdminPrincipal``."""
 
@@ -150,22 +134,10 @@ class AdminAuthProvider(ABC):
         request: Request | None = None,
         *,
         authorization: str | None = None,
-        require_csrf: bool = True,
         required_permission: str | None = None,
-        allow_service_token: bool = True,
     ) -> AdminPrincipal:
         """Authorize a request and verify an optional fine-grained Search_Admin permission."""
-        principal = self.authorize_request(
-            request,
-            authorization=authorization,
-            require_csrf=require_csrf,
-        )
-        if not allow_service_token and principal.is_service_account:
-            raise HTTPException(
-                status_code=403,
-                detail="Service tokens are not permitted for interactive user endpoints",
-                headers={"X-Auth-Mode": self.auth_mode},
-            )
+        principal = self.authorize_request(request, authorization=authorization)
         if (
             required_permission
             and principal.permissions
@@ -202,7 +174,7 @@ class BoncAuthNotConfiguredError(RuntimeError):
 
 
 class BoncAuthUnavailableError(RuntimeError):
-    """Raised when BONC verification dependencies (JWKS / introspection / authz) are unreachable."""
+    """Raised when BONC verification is unreachable or returns an unexpected response."""
 
 
 class BoncTokenExtractionError(ValueError):
@@ -210,7 +182,7 @@ class BoncTokenExtractionError(ValueError):
 
 
 class BoncTokenInvalidError(ValueError):
-    """Raised when a BONC access token fails cryptographic, structural, or claim validation."""
+    """Raised when a BONC access token is invalid, expired, revoked, or belongs to an inactive user."""
 
 
 class BoncAuthorizationDeniedError(PermissionError):
@@ -218,7 +190,7 @@ class BoncAuthorizationDeniedError(PermissionError):
 
 
 # ---------------------------------------------------------------------------
-# Token extraction & unverified JWT header guard
+# Strict Bearer token extraction
 # ---------------------------------------------------------------------------
 
 
@@ -239,7 +211,7 @@ def extract_bearer_token(authorization: str | None) -> str:
     """Strictly extract ``<AuthToken>`` from ``Authorization: Bearer <AuthToken>``.
 
     Rejects missing headers, non-Bearer schemes, empty tokens, extra whitespace
-    segments, control characters, and non-ASCII characters.
+    segments, control characters, oversized tokens, and non-ASCII characters.
     """
     if not isinstance(authorization, str):
         raise BoncTokenExtractionError("Missing Authorization header")
@@ -265,62 +237,6 @@ def extract_bearer_token(authorization: str | None) -> str:
     return token
 
 
-def _b64url_decode(segment: str) -> bytes:
-    if not segment or not all(
-        ch.isalnum() or ch in {"-", "_"} for ch in segment
-    ):
-        raise BoncTokenInvalidError("Malformed base64url segment")
-    padding = "=" * (-len(segment) % 4)
-    try:
-        return base64.urlsafe_b64decode(segment + padding)
-    except Exception as exc:
-        raise BoncTokenInvalidError("Malformed base64url encoding") from exc
-
-
-def inspect_jwt_structure_and_header(
-    raw_token: str,
-    *,
-    allowed_algorithms: frozenset[str],
-) -> dict[str, Any]:
-    """Validate JWS 3-segment structure and header algorithm BEFORE cryptographic verification.
-
-    Strictly rejects ``alg=none``, missing algorithms, and algorithms outside the
-    explicit server-configured allowlist. NEVER decodes or returns payload claims
-    as trusted identity information.
-    """
-    if not allowed_algorithms or any(alg.strip().lower() == "none" for alg in allowed_algorithms):
-        raise BoncAuthNotConfiguredError("JWT algorithm allowlist is missing or unsafe")
-
-    segments = raw_token.split(".")
-    if len(segments) != 3 or any(not seg for seg in segments):
-        raise BoncTokenInvalidError("Malformed JWT structure")
-
-    header_bytes = _b64url_decode(segments[0])
-    # Validate payload and signature segments are valid base64url (without trusting payload).
-    _b64url_decode(segments[1])
-    sig_bytes = _b64url_decode(segments[2])
-    if not sig_bytes:
-        raise BoncTokenInvalidError("Unsigned JWT rejected")
-
-    try:
-        header = json.loads(header_bytes.decode("utf-8"))
-    except Exception as exc:
-        raise BoncTokenInvalidError("Malformed JWT header JSON") from exc
-
-    if not isinstance(header, dict):
-        raise BoncTokenInvalidError("Malformed JWT header")
-
-    alg = header.get("alg")
-    if not isinstance(alg, str) or not alg.strip():
-        raise BoncTokenInvalidError("Missing JWT alg header")
-    if alg.strip().lower() == "none":
-        raise BoncTokenInvalidError("Unsigned JWT algorithm 'none' is forbidden")
-    if alg not in allowed_algorithms:
-        raise BoncTokenInvalidError("Unsupported JWT signing algorithm")
-
-    return header
-
-
 # ---------------------------------------------------------------------------
 # Verified BONC identity, claims policy, verifier contract & role policy
 # ---------------------------------------------------------------------------
@@ -328,7 +244,7 @@ def inspect_jwt_structure_and_header(
 
 @dataclass(frozen=True)
 class VerifiedBoncIdentity:
-    """Trusted identity returned ONLY after cryptographic or server-side BONC verification."""
+    """Trusted identity returned ONLY after authoritative BONC server-side verification."""
 
     user_id: str
     username: str | None
@@ -348,22 +264,47 @@ class VerifiedBoncIdentity:
 
 @dataclass(frozen=True)
 class BoncClaimsValidationConfig:
-    """Explicit server-side validation rules for verified BONC token claims."""
+    """Server-side validation rules for verified BONC identities.
 
-    allowed_algorithms: frozenset[str]
-    expected_issuer: str
-    expected_audience: str
+    When ``delegated_token_validation=True`` (used for BONC's authoritative
+    ``getUserDetail`` endpoint), signature, expiry, and revocation checks are
+    performed remotely by BONC .NET while Search_Admin still enforces a valid
+    ``user_id`` and validates any optional timestamps if present.
+    """
+
+    allowed_algorithms: frozenset[str] = frozenset()
+    expected_issuer: str = ""
+    expected_audience: str = ""
     allowed_key_ids: frozenset[str] | None = None
     expected_token_type: str | None = None
     clock_skew_seconds: int = 0
     require_algorithm: bool = True
+    delegated_token_validation: bool = False
+
+    @classmethod
+    def delegated_server_verification(
+        cls,
+        *,
+        clock_skew_seconds: int = 0,
+    ) -> BoncClaimsValidationConfig:
+        """Build a claims config for authoritative .NET ``getUserDetail`` verification."""
+        return cls(
+            allowed_algorithms=frozenset(),
+            expected_issuer="",
+            expected_audience="",
+            clock_skew_seconds=clock_skew_seconds,
+            require_algorithm=False,
+            delegated_token_validation=True,
+        )
 
     def is_valid(self) -> bool:
+        if not (0 <= int(self.clock_skew_seconds) <= _MAX_CLOCK_SKEW_SECONDS):
+            return False
+        if self.delegated_token_validation:
+            return True
         if not self.expected_issuer or not self.expected_issuer.strip():
             return False
         if not self.expected_audience or not self.expected_audience.strip():
-            return False
-        if not (0 <= int(self.clock_skew_seconds) <= _MAX_CLOCK_SKEW_SECONDS):
             return False
         if self.require_algorithm:
             if not self.allowed_algorithms:
@@ -379,7 +320,7 @@ def validate_verified_bonc_identity(
     *,
     now_utc: datetime | None = None,
 ) -> VerifiedBoncIdentity:
-    """Enforce defense-in-depth claim invariants on an already-verified BONC identity."""
+    """Enforce defense-in-depth identity invariants on an already-verified BONC identity."""
     if not config.is_valid():
         raise BoncAuthNotConfiguredError("BONC claims validation configuration is incomplete")
 
@@ -387,7 +328,7 @@ def validate_verified_bonc_identity(
     if not user_id or len(user_id) > 256:
         raise BoncTokenInvalidError("Verified BONC token is missing a valid user identifier")
 
-    if config.require_algorithm:
+    if not config.delegated_token_validation and config.require_algorithm:
         alg = (identity.algorithm or "").strip() if isinstance(identity.algorithm, str) else ""
         if not alg or alg.lower() == "none" or alg not in config.allowed_algorithms:
             raise BoncTokenInvalidError("Verified BONC token algorithm is not allowed")
@@ -402,27 +343,36 @@ def validate_verified_bonc_identity(
         if not typ or typ.lower() != config.expected_token_type.strip().lower():
             raise BoncTokenInvalidError("Verified BONC token type constraint failed")
 
-    issuer = (identity.issuer or "").strip() if isinstance(identity.issuer, str) else ""
-    if not issuer or issuer != config.expected_issuer.strip():
-        raise BoncTokenInvalidError("Verified BONC token issuer mismatch")
+    issuer: str | None = (
+        identity.issuer.strip() if isinstance(identity.issuer, str) and identity.issuer.strip() else None
+    )
+    if not config.delegated_token_validation or config.expected_issuer.strip():
+        if not issuer or issuer != config.expected_issuer.strip():
+            raise BoncTokenInvalidError("Verified BONC token issuer mismatch")
 
     expected_aud = config.expected_audience.strip()
     if isinstance(identity.audience, str):
-        aud_values = (identity.audience.strip(),) if identity.audience.strip() else ()
+        aud_values: tuple[str, ...] | None = (
+            (identity.audience.strip(),) if identity.audience.strip() else ()
+        )
     elif isinstance(identity.audience, tuple):
         aud_values = tuple(a.strip() for a in identity.audience if isinstance(a, str) and a.strip())
     else:
-        aud_values = ()
-    if expected_aud not in aud_values:
-        raise BoncTokenInvalidError("Verified BONC token audience mismatch")
+        aud_values = () if not config.delegated_token_validation else None
+    if not config.delegated_token_validation or expected_aud:
+        if not aud_values or expected_aud not in aud_values:
+            raise BoncTokenInvalidError("Verified BONC token audience mismatch")
 
     now = _normalize_utc_naive(now_utc) or _utc_now_naive()
     skew = timedelta(seconds=int(config.clock_skew_seconds))
 
     expires_at = _normalize_utc_naive(identity.expires_at_utc)
-    if expires_at is None:
-        raise BoncTokenInvalidError("Verified BONC token is missing expiration (exp)")
-    if expires_at <= (now - skew):
+    if not config.delegated_token_validation:
+        if expires_at is None:
+            raise BoncTokenInvalidError("Verified BONC token is missing expiration (exp)")
+        if expires_at <= (now - skew):
+            raise BoncTokenInvalidError("Verified BONC token has expired")
+    elif expires_at is not None and expires_at <= (now - skew):
         raise BoncTokenInvalidError("Verified BONC token has expired")
 
     not_before = _normalize_utc_naive(identity.not_before_utc)
@@ -468,12 +418,7 @@ def validate_verified_bonc_identity(
 
 
 class BoncTokenVerifier(ABC):
-    """Abstract verification adapter matching BONC's approved verification contract.
-
-    Concrete implementations (e.g., JWKS/public-key JWT verifier, verified
-    symmetric JWT verifier, or official BONC server-side introspection client)
-    must only be added once BONC's real verification mechanism is established.
-    """
+    """Abstract verification adapter backed by BONC's ``getUserDetail`` endpoint."""
 
     @abstractmethod
     def is_configured(self) -> bool:
@@ -481,13 +426,7 @@ class BoncTokenVerifier(ABC):
 
     @abstractmethod
     def verify_access_token(self, raw_token: str) -> VerifiedBoncIdentity:
-        """Verify ``raw_token`` and return a trusted ``VerifiedBoncIdentity``.
-
-        Must raise:
-          - ``BoncAuthNotConfiguredError`` when verification config is missing.
-          - ``BoncAuthUnavailableError`` on verification service/key timeout or outage.
-          - ``BoncTokenInvalidError`` on signature, format, expiry, or claim failure.
-        """
+        """Verify ``raw_token`` and return a trusted ``VerifiedBoncIdentity``."""
 
 
 AuthorizationResolver = Callable[
@@ -498,11 +437,11 @@ AuthorizationResolver = Callable[
 
 @dataclass(frozen=True)
 class BoncRoleAuthorizationPolicy:
-    """Explicit mapping from confirmed BONC roles/permissions to Search_Admin capabilities.
+    """Explicit mapping from verified BONC roles/permissions to Search_Admin capabilities.
 
-    Never invents default BONC role names and never grants Admin access to every
-    authenticated BONC user. Fails closed with ``BoncAuthNotConfiguredError``
-    unless explicit role/permission mappings are configured.
+    Never grants Admin access to ordinary (e.g. ``Basic``) BONC users. Fails
+    closed with ``BoncAuthNotConfiguredError`` unless explicit role/permission
+    mappings are configured.
     """
 
     allowed_admin_roles: frozenset[str] = frozenset()
@@ -578,7 +517,7 @@ class BoncRoleAuthorizationPolicy:
 
 
 # ---------------------------------------------------------------------------
-# BoncJwtAuthProvider & MisconfiguredAuthModeProvider
+# BoncJwtAuthProvider (Sole Search Admin Authentication Provider)
 # ---------------------------------------------------------------------------
 
 
@@ -589,69 +528,11 @@ def _matches_env_secret(candidate: str, env_name: str) -> bool:
     return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
 
 
-def _authorize_optional_cli_service_token(
-    raw_token: str,
-    *,
-    allow_cli_service_token: bool,
-    allow_service_token_on_route: bool,
-    required_permission: str | None,
-) -> AdminPrincipal | None:
-    """Keep optional CLI/automation tokens strictly separated from BONC human users.
-
-    - Never accepts ``PRODUCTION_SEARCH_AUTH_TOKEN``, ``SEARCH_ADMIN_API_TOKEN``,
-      or ``SEARCH_INTERNAL_API_TOKEN`` (or any other unrelated service credential).
-    - Only accepts ``SEARCH_ADMIN_SERVICE_TOKEN`` when explicitly enabled via
-      ``allow_cli_service_token=True``, only on CLI-allowlisted permissions
-      (``admin:search:execute``, ``admin:categories:read``), and NEVER on
-      interactive browser/session routes.
-    """
-    if not allow_cli_service_token:
-        return None
-
-    expected_service = os.getenv("SEARCH_ADMIN_SERVICE_TOKEN", "").strip()
-    if not expected_service:
-        return None
-
-    # Refuse if misconfigured to share a secret with another service token.
-    for other_key in (
-        "PRODUCTION_SEARCH_AUTH_TOKEN",
-        "SEARCH_ADMIN_API_TOKEN",
-        "SEARCH_INTERNAL_API_TOKEN",
-    ):
-        if _matches_env_secret(expected_service, other_key):
-            return None
-
-    if not hmac.compare_digest(raw_token.encode("utf-8"), expected_service.encode("utf-8")):
-        return None
-
-    if not allow_service_token_on_route or required_permission not in CLI_AUTOMATION_ALLOWED_PERMISSIONS:
-        raise HTTPException(
-            status_code=403,
-            detail="CLI service token is not permitted for this operation",
-            headers={"X-Auth-Mode": "bonc_jwt"},
-        )
-
-    actor = (
-        os.getenv("SEARCH_ADMIN_SERVICE_ACTOR", "admin:service").strip() or "admin:service"
-    )[:256]
-    return AdminPrincipal(
-        actor=actor,
-        username=actor,
-        auth_method="bearer",
-        roles=("automation",),
-        permissions=tuple(sorted(CLI_AUTOMATION_ALLOWED_PERMISSIONS)),
-        user_id=None,
-        is_service_account=True,
-    )
-
-
 class BoncJwtAuthProvider(AdminAuthProvider):
-    """BONC Bearer access-token authentication & Admin authorization provider.
+    """Mandatory BONC Bearer access-token authentication & Admin authorization provider.
 
-    Disabled and fail-closed (HTTP 503) by default until a real
-    ``BoncTokenVerifier``, ``BoncClaimsValidationConfig``, and
-    ``BoncRoleAuthorizationPolicy`` matching BONC's confirmed contract are
-    supplied. Never falls back to local cookie/password authentication.
+    Fails closed (HTTP 503) if ``verifier``, ``claims_config``, or ``role_policy``
+    is unconfigured. Never falls back to local logins, cookies, or static tokens.
     """
 
     def __init__(
@@ -660,21 +541,16 @@ class BoncJwtAuthProvider(AdminAuthProvider):
         verifier: BoncTokenVerifier | None = None,
         claims_config: BoncClaimsValidationConfig | None = None,
         role_policy: BoncRoleAuthorizationPolicy | None = None,
-        allow_cli_service_token: bool = False,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self._verifier = verifier
         self._claims_config = claims_config
         self._role_policy = role_policy
-        self._allow_cli_service_token = bool(allow_cli_service_token)
         self._now_provider = now_provider
 
     @property
     def auth_mode(self) -> str:
         return "bonc_jwt"
-
-    def supports_local_login(self) -> bool:
-        return False
 
     def is_configured(self) -> bool:
         return bool(
@@ -715,7 +591,7 @@ class BoncJwtAuthProvider(AdminAuthProvider):
         raw_header = self._extract_raw_header(request, authorization)
         raw_token = extract_bearer_token(raw_header)
 
-        # Reject known non-BONC service/internal tokens explicitly before calling verifier.
+        # Reject known non-BONC/observability secrets explicitly before calling BONC .NET.
         for env_key in _FORBIDDEN_NON_BONC_TOKEN_ENV_KEYS:
             if _matches_env_secret(raw_token, env_key):
                 raise BoncTokenInvalidError("Non-BONC service token cannot authenticate a BONC user")
@@ -729,14 +605,11 @@ class BoncJwtAuthProvider(AdminAuthProvider):
         request: Request | None = None,
         *,
         authorization: str | None = None,
-        require_csrf: bool = True,
     ) -> AdminPrincipal:
         return self.authorize_permission(
             request,
             authorization=authorization,
-            require_csrf=require_csrf,
             required_permission=None,
-            allow_service_token=True,
         )
 
     def authorize_permission(
@@ -744,32 +617,11 @@ class BoncJwtAuthProvider(AdminAuthProvider):
         request: Request | None = None,
         *,
         authorization: str | None = None,
-        require_csrf: bool = True,  # Unused for stateless Bearer JWT auth; kept for interface compatibility
         required_permission: str | None = None,
-        allow_service_token: bool = True,
     ) -> AdminPrincipal:
-        _ = require_csrf  # Bearer Authorization headers do not use cookie-based CSRF tokens.
-
-        # Separate, explicitly opted-in CLI automation path (strictly narrow permissions).
-        raw_header = self._extract_raw_header(request, authorization)
-        if self._allow_cli_service_token and isinstance(raw_header, str) and raw_header.strip():
-            try:
-                candidate = extract_bearer_token(raw_header)
-            except BoncTokenExtractionError:
-                candidate = ""
-            if candidate:
-                service_principal = _authorize_optional_cli_service_token(
-                    candidate,
-                    allow_cli_service_token=self._allow_cli_service_token,
-                    allow_service_token_on_route=allow_service_token,
-                    required_permission=required_permission,
-                )
-                if service_principal is not None:
-                    attach_request_principal(request, service_principal)
-                    return service_principal
-
         # Fail closed with 503 if verifier, claims validation, or Admin role mapping is unconfigured.
         if not self.is_configured():
+            _mark_request_auth_failed(request)
             raise HTTPException(
                 status_code=503,
                 detail="BONC authentication is not configured",
@@ -784,12 +636,14 @@ class BoncJwtAuthProvider(AdminAuthProvider):
                 required_permission=required_permission,
             )
         except BoncAuthNotConfiguredError as exc:
+            _mark_request_auth_failed(request)
             raise HTTPException(
                 status_code=503,
                 detail=str(exc) or "BONC authentication is not configured",
                 headers={"X-Auth-Mode": self.auth_mode},
             ) from exc
         except BoncAuthUnavailableError as exc:
+            _mark_request_auth_failed(request)
             logger.warning(
                 "BONC authentication service unavailable (exception_type=%s)",
                 type(exc).__name__,
@@ -800,6 +654,7 @@ class BoncJwtAuthProvider(AdminAuthProvider):
                 headers={"X-Auth-Mode": self.auth_mode},
             ) from exc
         except (BoncTokenExtractionError, BoncTokenInvalidError) as exc:
+            _mark_request_auth_failed(request)
             raise HTTPException(
                 status_code=401,
                 detail="Authentication required",
@@ -809,14 +664,17 @@ class BoncJwtAuthProvider(AdminAuthProvider):
                 },
             ) from exc
         except BoncAuthorizationDeniedError as exc:
+            _mark_request_auth_failed(request)
             raise HTTPException(
                 status_code=403,
                 detail=str(exc) or "Administrator access required",
                 headers={"X-Auth-Mode": self.auth_mode},
             ) from exc
         except HTTPException:
+            _mark_request_auth_failed(request)
             raise
         except Exception as exc:
+            _mark_request_auth_failed(request)
             logger.error(
                 "Unexpected BONC authentication error (exception_type=%s)",
                 type(exc).__name__,
@@ -827,7 +685,7 @@ class BoncJwtAuthProvider(AdminAuthProvider):
                 headers={"X-Auth-Mode": self.auth_mode},
             ) from exc
 
-        # Prefer stable BONC user ID for audit identity (UpdatedBy, ChangedBy, SearchLogs).
+        # Prefer stable BONC UserRowId for audit identity (UpdatedBy, ChangedBy, SearchLogs).
         actor = identity.user_id[:256]
         display_username = identity.username or identity.user_id
 
@@ -838,10 +696,8 @@ class BoncJwtAuthProvider(AdminAuthProvider):
             roles=effective_roles,
             permissions=granted_permissions,
             user_id=identity.user_id,
-            is_service_account=False,
             session_id=identity.session_id,
             expires_at_utc=identity.expires_at_utc,
-            csrf_token=None,
             token_id=identity.token_id,
         )
         attach_request_principal(request, principal)
@@ -869,33 +725,3 @@ class BoncJwtAuthProvider(AdminAuthProvider):
             return identity.user_id[:256]
         except Exception:
             return None
-
-
-class MisconfiguredAuthModeProvider(AdminAuthProvider):
-    """Fail-closed provider activated when SEARCH_ADMIN_AUTH_MODE is invalid or disallowed."""
-
-    def __init__(self, reason: str = "Search Admin authentication mode configuration is invalid") -> None:
-        self._reason = reason
-
-    @property
-    def auth_mode(self) -> str:
-        return "invalid"
-
-    def supports_local_login(self) -> bool:
-        return False
-
-    def is_configured(self) -> bool:
-        return False
-
-    def authorize_request(
-        self,
-        request: Request | None = None,
-        *,
-        authorization: str | None = None,
-        require_csrf: bool = True,
-    ) -> AdminPrincipal:
-        raise HTTPException(
-            status_code=503,
-            detail=self._reason,
-            headers={"X-Auth-Mode": "bonc_jwt"},
-        )

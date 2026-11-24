@@ -147,8 +147,6 @@ _KV_SECRET_RE = re.compile(
 )
 
 _SECRET_ENV_KEYS = (
-    "SEARCH_ADMIN_SERVICE_TOKEN",
-    "SEARCH_ADMIN_PASSWORD_HASH",
     "PRODUCTION_SEARCH_AUTH_TOKEN",
     "SEARCH_PLATFORM_SQL_ODBC_CONNECT",
     "SEARCH_PLATFORM_SQL_ODBC_CONNECT_LOCAL",
@@ -377,19 +375,6 @@ def _clean_user_id(raw_user_id: str | None) -> str | None:
     if not cleaned:
         return None
     return cleaned[:MAX_USER_ID_LENGTH]
-
-
-def _verify_optional_admin_bearer(authorization: Any) -> str | None:
-    """Validate optional CLI service Bearer token in constant time without raising."""
-    expected = os.getenv("SEARCH_ADMIN_SERVICE_TOKEN", "").strip()
-    if not expected or not isinstance(authorization, str) or not authorization:
-        return None
-    parts = authorization.split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-        return None
-    if not hmac.compare_digest(parts[1].strip().encode("utf-8"), expected.encode("utf-8")):
-        return None
-    return os.getenv("SEARCH_ADMIN_SERVICE_ACTOR", "admin:service").strip() or "admin:service"
 
 
 def resolve_trusted_identity(

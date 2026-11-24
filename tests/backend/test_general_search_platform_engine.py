@@ -15,14 +15,35 @@ BACKEND_DIR = Path(__file__).resolve().parents[2] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from app.db import auth_db, platform_db  # noqa: E402
+from app.db import platform_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.services import (  # noqa: E402
+    admin_auth,
+    bonc_auth,
     embedding_model,
     platform_search,
     search_evaluation,
     source_sync,
 )
+
+
+class _EngineTestBoncVerifier(bonc_auth.BoncTokenVerifier):
+    def __init__(self, expected_token: str, actor: str = "admin:tester") -> None:
+        self._expected_token = expected_token
+        self._actor = actor
+
+    def is_configured(self) -> bool:
+        return True
+
+    def verify_access_token(self, raw_token: str) -> bonc_auth.VerifiedBoncIdentity:
+        if raw_token != self._expected_token:
+            raise bonc_auth.BoncTokenInvalidError("Invalid test BONC token")
+        return bonc_auth.VerifiedBoncIdentity(
+            user_id=self._actor,
+            username=self._actor,
+            expires_at_utc=None,
+            roles=("Admin",),
+        )
 
 
 class _DeterministicFakeEmbeddingModel:
@@ -148,14 +169,21 @@ def _category_config(
 class TestGeneralSearchPlatformEngine(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_env = dict(os.environ)
-        os.environ["SEARCH_ADMIN_AUTH_DB_URL"] = "sqlite:///:memory:"
-        os.environ["SEARCH_ADMIN_SERVICE_TOKEN"] = "engine-test-service-token"
-        os.environ["SEARCH_ADMIN_SERVICE_ACTOR"] = "admin:tester"
+        os.environ["APP_ENV"] = "local"
         os.environ["PRODUCTION_OBSERVABILITY_ENABLED"] = "false"
         os.environ["SEARCH_PLATFORM_WARMUP_EMBEDDING_MODEL"] = "false"
-        self.headers = {"Authorization": "Bearer engine-test-service-token"}
+        self.headers = {"Authorization": "Bearer engine-test-bonc-token"}
 
-        auth_db.reset_auth_engine()
+        admin_auth.reset_auth_provider()
+        admin_auth.set_auth_provider(
+            bonc_auth.BoncJwtAuthProvider(
+                verifier=_EngineTestBoncVerifier("engine-test-bonc-token", "admin:tester"),
+                claims_config=bonc_auth.BoncClaimsValidationConfig.delegated_server_verification(),
+                role_policy=bonc_auth.BoncRoleAuthorizationPolicy(
+                    allowed_admin_roles=frozenset({"Admin", "SuperAdmin"})
+                ),
+            )
+        )
         platform_db.reset_platform_engine()
         platform_search.clear_all_category_indexes()
         platform_db.set_platform_engine(platform_db.create_in_memory_sqlite_platform_engine())
@@ -168,8 +196,8 @@ class TestGeneralSearchPlatformEngine(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._model_patch.stop()
+        admin_auth.reset_auth_provider()
         platform_search.clear_all_category_indexes()
-        auth_db.reset_auth_engine()
         platform_db.reset_platform_engine()
         os.environ.clear()
         os.environ.update(self._orig_env)

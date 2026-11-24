@@ -12,7 +12,7 @@ from app.clients.production_search_client import (
     ProductionSearchClient,
     get_production_search_client,
 )
-from app.db import auth_db, platform_db
+from app.db import platform_db
 from app.services import admin_auth, embedding_model
 
 router = APIRouter(tags=["Search Platform health"])
@@ -29,17 +29,8 @@ async def readiness(
     production_client: ProductionSearchClient = Depends(get_production_search_client),
 ):
     provider = admin_auth.get_auth_provider()
-    uses_local_store = provider.supports_local_login()
-    if uses_local_store:
-        auth_store_ok = auth_db.check_auth_db_ready()
-        auth_store_state = "ready" if auth_store_ok else "not_ready"
-        auth_provider_ok = auth_store_ok
-        auth_provider_state = "ready" if auth_store_ok else "not_ready"
-    else:
-        auth_store_ok = True
-        auth_store_state = "not_used"
-        auth_provider_ok = provider.is_configured()
-        auth_provider_state = "ready" if auth_provider_ok else "not_configured"
+    auth_provider_ok = provider.is_configured()
+    auth_provider_state = "ready" if auth_provider_ok else "not_configured"
 
     platform_db_ok, platform_db_latency_ms, _ = platform_db.check_platform_db_ready()
 
@@ -59,14 +50,13 @@ async def readiness(
     else:
         embedding_state = "lazy"
 
-    ready = auth_store_ok and auth_provider_ok and platform_db_ok and embedding_state != "failed"
+    ready = auth_provider_ok and platform_db_ok and embedding_state != "failed"
     body = {
         "status": "ready" if ready else "not_ready",
         "service": "search-admin-platform",
         "checks": {
             "authMode": provider.auth_mode,
             "authProvider": auth_provider_state,
-            "authStore": auth_store_state,
             "platformDatabase": "ready" if platform_db_ok else "not_ready",
             "platformDatabaseLatencyMs": platform_db_latency_ms,
             "embeddingModel": embedding_state,
