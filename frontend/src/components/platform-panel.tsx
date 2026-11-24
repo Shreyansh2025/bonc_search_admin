@@ -2602,7 +2602,7 @@ export default function PlatformPanel({
                           Restores stored snapshot v{pendingRollbackItem.config_version} as a
                           new configuration version (v{editingVersion + 1}), preserves all
                           history, and invalidates this category&apos;s worker cache via an
-                          authenticated CSRF-protected request.
+                          authenticated Admin request.
                         </p>
                       </div>
                       <label className="setting-field">

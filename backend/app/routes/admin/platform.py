@@ -108,7 +108,6 @@ def admin_search_category(
         principal = admin_auth.authorize_admin_request(
             request,
             authorization=request.headers.get("authorization"),
-            require_csrf=True,
             required_permission=admin_auth.ADMIN_PERMISSION_SEARCH_EXECUTE,
         )
         identity_type, authenticated_user_id, session_id_hash = (

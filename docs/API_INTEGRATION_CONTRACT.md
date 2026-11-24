@@ -7,15 +7,15 @@ Base URL (local default): `http://127.0.0.1:8004` (proxied from frontend via `/a
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health/live` | Process liveness (`{"status": "ok", "service": "search-admin-platform"}`) |
-| `GET` | `/health/ready` | Checks local `authStore`, `platformDatabase` (`SELECT 1`), `embeddingModel` state, and reports optional `productionObservability` (`disabled`/`enabled`; never blocks readiness) |
+| `GET` | `/health/ready` | Checks `authProvider` (BONC config), `platformDatabase` (`SELECT 1`), `embeddingModel` state, and reports optional `productionObservability` (`disabled`/`enabled`; never blocks readiness) |
 
 ## 2. Admin Authentication (`/api/admin/auth/*`)
 
-| Method | Path | Auth / CSRF | Purpose |
+BONC JWT verification via `GET /api/userService/getUserDetail` is the sole supported Search Admin user authentication method. Local login (`/login`) and local logout (`/logout`) endpoints do not exist.
+
+| Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/api/admin/auth/login` | Credentials + rate limit | Creates persistent SQLite session, sets `HttpOnly` `bonc_search_admin_platform_session` cookie, returns `csrf_token`, `actor`, `roles` |
-| `GET` | `/api/admin/auth/session` | Session cookie or service Bearer | Validates active principal; clears invalid cookie on 401 |
-| `POST` | `/api/admin/auth/logout` | Session + `X-CSRF-Token` | Revokes session and clears cookie |
+| `GET` | `/api/admin/auth/session` | `Authorization: Bearer <BONC AuthToken>` | Verifies the caller's BONC token against BONC `.NET` `getUserDetail`, enforces `Admin`/`SuperAdmin` roles, and returns verified `user_id`, `actor`, `username`, `roles`, and `permissions` (`Cache-Control: no-store`) |
 
 ## 3. Public General Search Platform Routes (`/api/platform/*`)
 
@@ -26,7 +26,7 @@ Base URL (local default): `http://127.0.0.1:8004` (proxied from frontend via `/a
 
 ## 4. Admin General Search Platform Routes (`/api/admin/platform/*`)
 
-All endpoints require Admin authentication via `AdminAuthProvider` (browser `HttpOnly` cookie + `X-CSRF-Token` on non-GET writes, OR backend-only `Authorization: Bearer <SEARCH_ADMIN_SERVICE_TOKEN>`).
+All endpoints enforce BONC Admin Bearer token authentication (`Authorization: Bearer <AuthToken>`) and explicit capability checks via `app.services.admin_auth`.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -58,7 +58,7 @@ All endpoints require Admin authentication via `AdminAuthProvider` (browser `Htt
 
 ## 6. Optional Read-Only Production Observability (`/api/admin/production/*`)
 
-Disabled by default (`PRODUCTION_OBSERVABILITY_ENABLED=false`). Strictly GET-only; never executes writes; unconditionally strips BrochureIQ `localProducts`.
+Disabled by default (`PRODUCTION_OBSERVABILITY_ENABLED=false`). Strictly GET-only; uses separate `PRODUCTION_SEARCH_*` backend credentials; never executes writes; unconditionally strips BrochureIQ `localProducts`.
 
 | Method | Path | Upstream Target (`origin/main`) |
 |---|---|---|
@@ -67,6 +67,7 @@ Disabled by default (`PRODUCTION_OBSERVABILITY_ENABLED=false`). Strictly GET-onl
 
 ## 7. Explicitly Removed / Excluded Endpoints
 
-- `GET /api/admin/search-settings`, `PUT /api/admin/search-settings`, `GET /api/admin/search-settings/history` — Retired (Decision #1).
+- `POST /api/admin/auth/login`, `POST /api/admin/auth/logout` — Retired (BONC JWT is the sole auth mechanism).
+- `GET/PUT /api/admin/search-settings`, `GET /api/admin/search-settings/history` — Retired (Decision #1).
 - `POST /api/admin/platform/categories/{category_id}/feedback` — Removed (Decision #2).
 - `POST /api/search` — Legacy B2B Product & Company Search remains owned by original production (`origin/main`).

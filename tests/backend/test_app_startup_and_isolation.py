@@ -19,22 +19,43 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app.config import resolve_allowed_origins  # noqa: E402
-from app.db import auth_db, platform_db  # noqa: E402
+from app.db import platform_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.schemas.platform import SQLServerSourceConfig, SourceValidationRequest  # noqa: E402
+from app.services import admin_auth, bonc_auth  # noqa: E402
+
+
+class _ReadyTestBoncVerifier(bonc_auth.BoncTokenVerifier):
+    def is_configured(self) -> bool:
+        return True
+
+    def verify_access_token(self, raw_token: str) -> bonc_auth.VerifiedBoncIdentity:
+        return bonc_auth.VerifiedBoncIdentity(
+            user_id="test-admin",
+            username="test-admin",
+            expires_at_utc=None,
+            roles=("Admin",),
+        )
 
 
 class TestAppStartupAndIsolation(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_env = dict(os.environ)
-        os.environ["SEARCH_ADMIN_AUTH_DB_URL"] = "sqlite:///:memory:"
         os.environ["PRODUCTION_OBSERVABILITY_ENABLED"] = "false"
         os.environ["SEARCH_PLATFORM_WARMUP_EMBEDDING_MODEL"] = "false"
-        auth_db.reset_auth_engine()
+        os.environ["APP_ENV"] = "local"
+        for key in (
+            "BONC_AUTH_VERIFY_URL",
+            "BONC_AUTH_ADMIN_ROLES",
+            "BONC_AUTH_CACHE_SECONDS",
+            "BONC_AUTH_TIMEOUT",
+        ):
+            os.environ.pop(key, None)
+        admin_auth.reset_auth_provider()
         platform_db.reset_platform_engine()
 
     def tearDown(self) -> None:
-        auth_db.reset_auth_engine()
+        admin_auth.reset_auth_provider()
         platform_db.reset_platform_engine()
         os.environ.clear()
         os.environ.update(self._orig_env)
@@ -65,16 +86,20 @@ class TestAppStartupAndIsolation(unittest.TestCase):
             Path("routes/platform.py"),
             Path("routes/observability.py"),
             Path("schemas/settings.py"),
+            Path("schemas/auth.py"),
             Path("services/search_ai_client.py"),
             Path("services/auth_db.py"),
+            Path("db/auth_db.py"),
         )
         retired_legacy_modules = (
             "app.routes.settings",
             "app.routes.platform",
             "app.routes.observability",
             "app.schemas.settings",
+            "app.schemas.auth",
             "app.services.search_ai_client",
             "app.services.auth_db",
+            "app.db.auth_db",
         )
         app_dir = BACKEND_DIR / "app"
         for retired_relpath in retired_legacy_relpaths:
@@ -125,7 +150,6 @@ class TestAppStartupAndIsolation(unittest.TestCase):
         probe_env = {
             **os.environ,
             "PYTHONPATH": str(BACKEND_DIR),
-            "SEARCH_ADMIN_AUTH_DB_URL": "sqlite:///:memory:",
             "PRODUCTION_OBSERVABILITY_ENABLED": "false",
             "SEARCH_PLATFORM_WARMUP_EMBEDDING_MODEL": "false",
         }
@@ -144,7 +168,7 @@ class TestAppStartupAndIsolation(unittest.TestCase):
             f"Clean subprocess import check failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
         )
         loaded_modules = set(json.loads(proc.stdout.strip().splitlines()[-1]))
-        self.assertIn("app.db.auth_db", loaded_modules)
+        self.assertIn("app.services.bonc_auth_adapter", loaded_modules)
         for legacy_mod in retired_legacy_modules:
             self.assertNotIn(
                 legacy_mod,
@@ -208,6 +232,15 @@ class TestAppStartupAndIsolation(unittest.TestCase):
     def test_independent_liveness_and_readiness_without_port_8002(self) -> None:
         engine = platform_db.create_in_memory_sqlite_platform_engine()
         platform_db.set_platform_engine(engine)
+        admin_auth.set_auth_provider(
+            bonc_auth.BoncJwtAuthProvider(
+                verifier=_ReadyTestBoncVerifier(),
+                claims_config=bonc_auth.BoncClaimsValidationConfig.delegated_server_verification(),
+                role_policy=bonc_auth.BoncRoleAuthorizationPolicy(
+                    allowed_admin_roles=frozenset({"Admin", "SuperAdmin"})
+                ),
+            )
+        )
 
         app = create_app(warmup_embedding_model=False, connect_platform_database=False)
         with TestClient(app) as client:
@@ -223,7 +256,9 @@ class TestAppStartupAndIsolation(unittest.TestCase):
             body = ready.json()
             self.assertEqual(body["status"], "ready")
             self.assertEqual(body["service"], "search-admin-platform")
-            self.assertEqual(body["checks"]["authStore"], "ready")
+            self.assertEqual(body["checks"]["authMode"], "bonc_jwt")
+            self.assertEqual(body["checks"]["authProvider"], "ready")
+            self.assertNotIn("authStore", body["checks"])
             self.assertEqual(body["checks"]["platformDatabase"], "ready")
             self.assertEqual(body["checks"]["productionObservability"], "disabled")
             self.assertNotIn("upstreamSearchAi", body["checks"])

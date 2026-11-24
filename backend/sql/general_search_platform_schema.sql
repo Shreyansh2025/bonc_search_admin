@@ -21,8 +21,9 @@
           dbo.ProductsAndServices, dbo.B2BCompanies, dbo.B2BProducts)
         - BrochureIQ tables (dbo.Brochures)
         - Retired legacy Catalog Thresholds tables (searchai.SearchAISettings)
-        - Admin session/rate-limit tables (owned separately by Search_Admin's
-          isolated local SQLite store in app/db/auth_db.py)
+        - Admin authentication tables (authentication is owned externally by
+          BONC JWT via .NET getUserDetail; Search_Admin stores no local user or
+          session tables)
 */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;

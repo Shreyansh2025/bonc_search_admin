@@ -1,60 +1,53 @@
-# BONC Authentication Integration — Discovery Report, Contract & Preparation
+# BONC Authentication Architecture (`getUserDetail`)
 
-## 1. Discovery Summary
+## 1. Consolidated Authentication Decision
 
-Inspection of the workspace (`BONC_Search_AI_Platform/`) and sibling project directories confirmed that **the main BONC application's backend authentication source, frontend authentication source, and Swagger/OpenAPI specification are not available in this workspace**.
+**BONC JWT verification through BONC's existing `.NET` `getUserDetail` endpoint is the ONLY supported Search Admin user authentication system.**
 
-- Existing code in `BONC_Search_AI_Platform/` covers only `Search_Admin/`, legacy `py-backend/` (BrochureIQ + legacy Search AI), `react-frontend/`, `search-ai-admin/`, and `lib/` (BrochureIQ API spec/client).
-- Sibling directory `bonc-short-content/` is a separate service whose own security readiness doc likewise marks the BONC production JWT contract as unresolved.
-- Indirect SQL Server schema evidence from `docs/people_search_configuration_audit.md` and `py-backend/sql/staging/02_create_vw_search_people_v2.sql` confirms the BONC database contains `dbo.BoncUser.UserRowId` (36-char UUID) and `dbo.UserRoles` / `dbo.Roles` (`Basic`, `Admin`, `SuperAdmin`, plus other staff roles). Database tables alone do **not** define BONC's JWT signing mechanism, claims, endpoints, or frontend token handoff.
+All legacy local username/password authentication, local SQLite session/rate-limit storage, session cookies, CSRF tokens, alternative `verify-admin` mode, CLI static admin tokens, and auth-disable toggles have been permanently removed.
 
-Per Phase 3 safety rules, **no BONC signing keys, algorithms, issuers, audiences, endpoints, claim names, role mappings, or browser globals were invented**. Only safe, contract-independent, fail-closed preparation was implemented inside `Search_Admin/`.
+## 2. End-to-End Authentication Flow
 
-## 2. BONC Authentication Contract Status
+1. An Admin signs in on BONC and obtains a BONC-issued JWT `AuthToken`.
+2. The Search Admin frontend holds the token strictly in JavaScript memory (via host-registered `registerBoncAuthProvider` or the standalone in-memory BONC AuthToken input — never in `localStorage`, `sessionStorage`, or cookies) and sends it on Admin API calls as:
+   ```http
+   Authorization: Bearer <AuthToken>
+   ```
+3. Search Admin's backend (`backend/app/services/bonc_auth_adapter.py`) decodes the JWT payload **only** to extract the untrusted `UserRowId` claim. It performs **no** local signature verification and requires **no** HS256 signing secret.
+4. Search Admin calls BONC's `.NET` endpoint (`BONC_AUTH_VERIFY_URL`, e.g. `https://api.boncnetwork.com/api/userService/getUserDetail`):
+   ```http
+   GET /api/userService/getUserDetail?userRowId=<UserRowId>
+   Authorization: Bearer <original AuthToken>
+   ```
+   with `follow_redirects=False` and configurable `BONC_AUTH_TIMEOUT` (default `5s`).
+5. BONC `.NET` authoritatively validates the token signature, expiry, and session/logout revocation status.
+6. Search Admin grants access **only** when ALL of the following hold:
+   - HTTP status is `200` and JSON payload is a valid object with `Success` not `false`.
+   - Returned `Data.UserRowId` (or bare DTO `UserRowId`) matches the token's `UserRowId` (case-insensitively); mismatch fails closed with `503`.
+   - `IsActive` is not `false` (inactive accounts fail closed with `401`).
+   - At least one role parsed from `UserRoles`, `RoleNames`, or `RoleName` (supporting `,`, `;`, `|` delimiters and lists, matched case-insensitively) is in `BONC_AUTH_ADMIN_ROLES` (default `Admin,SuperAdmin`). Authenticated non-admin users (e.g., `Basic`) receive `403 Forbidden`.
+7. Verified BONC admin identities are mapped via `BoncRoleAuthorizationPolicy` into `AdminPrincipal`, propagating `UserRowId` into `UpdatedBy`, `ChangedBy`, `SearchLogs.AuthenticatedUserId`, and `ApiRequestLogs.AuthenticatedUserId`.
 
-| Item | Status | Evidence / Required Confirmation |
-|---|---|---|
-| Login endpoint | **UNCONFIRMED** | Main BONC backend source / Swagger not in workspace |
-| Login request | **UNCONFIRMED** | Exact fields and casing not in workspace |
-| Login response | **UNCONFIRMED** | Expected fields (`AuthToken`, `RefreshToken`, `TokenExpireDate`, `RefreshTokenExpireDate`, user/roles) must be verified against BONC API |
-| Access token | **UNCONFIRMED** | Expected `Authorization: Bearer <AuthToken>`; exact JWT vs opaque format unverified |
-| Refresh token | **UNCONFIRMED** | Owned by BONC; exact refresh endpoint & rotation rules not in workspace |
-| Expiration | **UNCONFIRMED** | Exact `exp` / `nbf` / `TokenExpireDate` semantics not in workspace |
-| Signing algorithm | **UNCONFIRMED** | Asymmetric (`RS256`/`ES256`) vs symmetric (`HS256`) not in workspace |
-| Verification mechanism | **UNCONFIRMED** | Public key / JWKS / shared key / introspection / approved library not in workspace |
-| Issuer (`iss`) | **UNCONFIRMED** | Not in workspace |
-| Audience (`aud`) | **UNCONFIRMED** | Not in workspace |
-| Identity | **PARTIAL (DB only)** | `dbo.BoncUser.UserRowId` (UUID) observed in DB audit; exact JWT claim (`sub` / `nameid` / `UserRowId`) unconfirmed |
-| Roles | **PARTIAL (DB only)** | `dbo.Roles.RoleName` (`Basic`, `Admin`, `SuperAdmin`, etc.) observed in DB audit; exact JWT claim or userinfo API unconfirmed |
-| Permissions | **UNCONFIRMED** | Exact Admin role IDs/names/scopes authorized for Search_Admin unconfirmed |
-| Refresh | **UNCONFIRMED** | Owned by BONC host; exact host refresh callback contract unconfirmed |
-| Logout | **UNCONFIRMED** | Owned by BONC; exact server revocation & host logout hook unconfirmed |
-| Frontend handoff | **UNCONFIRMED** | Main BONC frontend source not in workspace; hosting model (embedded shell vs strict-origin iframe) unconfirmed |
+## 3. Error Handling & Fail-Closed Contract
 
-## 3. Implemented Fail-Closed Preparation in `Search_Admin/`
+| Condition | HTTP Response |
+|---|---|
+| Valid `Admin` / `SuperAdmin` token | `200` (authenticated) |
+| Authenticated non-admin (`Basic`) token | `403 Forbidden` |
+| Missing/malformed header, non-JWT, missing `UserRowId`, invalid/expired/revoked token, inactive user | `401 Unauthorized` (`WWW-Authenticate: Bearer`) |
+| `BONC_AUTH_VERIFY_URL` unset | `503 Service Unavailable` (fail-closed) |
+| Mismatched `UserRowId`, `Success: false`, malformed JSON, timeout, network error, unexpected HTTP status | `503 Service Unavailable` (fail-closed) |
 
-1. **Auth Mode Selection (`app/config.py`)**:
-   - `APP_ENV != "local"` (`staging`, `production`) defaults to `SEARCH_ADMIN_AUTH_MODE=bonc_jwt` and strictly disallows `local_session` (fails closed with HTTP `503`).
-   - `APP_ENV == "local"` supports explicit `local_session` (transition dev mode) or `bonc_jwt` (fail-closed, zero fallback to local session).
-   - Interactive OpenAPI/Swagger (`/docs`, `/redoc`, `/openapi.json`) is enabled in `local` and disabled by default outside `local`.
-2. **BONC Provider & Authorization Layer (`app/services/bonc_auth.py`, `app/services/bonc_auth_adapter.py`, `app/services/admin_auth.py`)**:
-   - `BoncJwtAuthProvider` implements `AdminAuthProvider` with strict Bearer token extraction (`401`), defense-in-depth verified claims checks (`alg` allowlist, `alg != none`, `iss`, `aud`, `exp`, `nbf`, optional `kid` & `typ`, required `user_id`), and separate `BoncRoleAuthorizationPolicy` capability mapping (`403` for ordinary BONC users or insufficient permissions).
-   - `BoncAuthPackageVerifierAdapter` (`backend/app/services/bonc_auth_adapter.py`) integrates the external reusable `bonc-auth` Python package (`bonc-auth[fastapi]` pinned by commit SHA `1a314e3e6db9959bc9a1f47db7a15d8bded155e7` in `backend/requirements.txt`) behind `BoncTokenVerifier` without duplicating package code or bypassing `BoncJwtAuthProvider` via `FastAPIAdminGuard`.
-   - **Architectural preference & unactivated status:** Local cryptographic JWT verification (JWKS, public key, or verified shared secret) behind `BoncTokenVerifier` remains the preferred mechanism if the `.NET` team supplies signing keys. `BoncAuthPackageVerifierAdapter` is prepared as an **unactivated** candidate adapter for HTTP verification; `build_default_auth_provider()` intentionally keeps `BoncJwtAuthProvider` unconfigured (`verifier=None`, `claims_config=None`, `role_policy=None`) and failing closed with HTTP `503` until BONC's real verification mechanism and trusted claims contract are confirmed.
-   - **Contract gap enforced fail-closed (HTTP `503`):** `bonc-auth` v0.2.0's documented example response (`{"adminId", "role", "sessionId"}`) omits `issuer` (`iss`), `audience` (`aud`), and `expires_at_utc` (`exp`), which `validate_verified_bonc_identity()` requires. `BoncAuthPackageVerifierAdapter` never fabricates missing claims and raises `BoncAuthUnavailableError` (HTTP `503`, never `401`) if an HTTP `200` verification response omits required trusted claims or returns malformed/conflicting field types. Additionally, an admin-only `/api/auth/verify-admin` endpoint returning `403` for ordinary BONC users cannot attribute non-admin users on public `/api/platform/search` requests (`try_authenticate_public_request` safely falls back to anonymous/session logging).
-   - Local login (`POST /api/admin/auth/login`) and local logout (`POST /api/admin/auth/logout`) return HTTP `404` when BONC mode is active.
-   - `AdminPrincipal` propagates the verified stable BONC `user_id` into `UpdatedBy`, `ChangedBy`, `SearchLogs.AuthenticatedUserId`, and `ApiRequestLogs.AuthenticatedUserId` (and preserves optional verified `session_id`).
-3. **CLI / Service Token Isolation**:
-   - `SEARCH_ADMIN_SERVICE_TOKEN` is disabled in BONC mode by default (`SEARCH_ADMIN_ALLOW_CLI_SERVICE_TOKEN=false`).
-   - Even when explicitly opted in for offline evaluation scripts, it is restricted strictly to `admin:search:execute` and `admin:categories:read`, marked `is_service_account=True`, and rejected on `/api/admin/auth/session` and all write/log/analytics routes.
-4. **Frontend In-Memory Host Adapter (`frontend/src/lib/bonc-auth.ts`, `search-api.ts`, `App.tsx`)**:
-   - Exposes `registerBoncAuthProvider(provider)` for approved host-managed in-memory token access, one-shot refresh delegation on `401`, and host logout delegation/subscription.
-   - Never writes tokens to `localStorage`, `sessionStorage`, cookies, URLs, logs, or Vite env vars.
-   - Production Vite builds default to `bonc` mode and never render an independent Search_Admin login form.
+## 4. Token Caching (`BONC_AUTH_CACHE_SECONDS`)
 
-## 4. Safe Local-Auth Retirement Plan (Future, Non-Destructive)
+- `CachedBoncTokenVerifier` caches **only successful** verifications, keyed by `SHA-256(raw_token)` (raw tokens are never stored as cache keys).
+- Rejections (`401`/`403`) and upstream failures (`503`) are **never** cached.
+- **`BONC_AUTH_CACHE_SECONDS=0`** (recommended for local testing): verifies every request against BONC `.NET`, reflecting BONC logout/revocation immediately.
+- **`BONC_AUTH_CACHE_SECONDS=60`** (typical staging/production trade-off): reduces round trips to `.NET` on multi-call dashboard pages, with up to 60 seconds of delay before a BONC sign-out takes effect in Search Admin.
 
-- **No database tables or SQLite files are dropped or modified in Phase 3.**
-- Historical SQL Server tables `searchai.AdminSessions` and `searchai.AdminLoginAttempts` (from legacy `py-backend` Migration 007) and `searchai.SearchCategoryHistory` (which also stores rollback provenance `RolledBackFromVersion`) remain untouched.
-- Local SQLite file `backend/data/admin_auth.db` is untouched and is not opened during lifespan startup when `SEARCH_ADMIN_AUTH_MODE=bonc_jwt`.
-- Once BONC end-to-end authentication is verified in staging and production, `LocalSessionAuthProvider`, `app/db/auth_db.py`, and local login/logout routes can be retired in a dedicated cleanup PR, followed by a DBA-approved archival/drop of legacy `searchai.AdminSessions` and `searchai.AdminLoginAttempts` only (preserving `searchai.SearchCategoryHistory`).
+## 5. Configuration & Security Boundaries
+
+- Required backend variable: `BONC_AUTH_VERIFY_URL` (must be HTTPS for any non-localhost host).
+- Configurable role & cache variables: `BONC_AUTH_ADMIN_ROLES` (default `Admin,SuperAdmin`), `BONC_AUTH_CACHE_SECONDS` (default `60`), `BONC_AUTH_TIMEOUT` (default `5`).
+- `APP_ENV` (`local` | `staging` | `production`) controls Swagger visibility and default local CORS origins only — BONC JWT authentication is mandatory in every environment.
+- **Separate Production Observability Boundary:** `PRODUCTION_SEARCH_*` settings (`PRODUCTION_OBSERVABILITY_ENABLED`, `PRODUCTION_SEARCH_BASE_URL`, `PRODUCTION_SEARCH_AUTH_MODE`, `PRODUCTION_SEARCH_AUTH_TOKEN`) are strictly for read-only backend-to-backend observability calls and are explicitly rejected if ever sent as a user Bearer token.

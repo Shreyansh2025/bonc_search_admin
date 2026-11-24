@@ -5,12 +5,12 @@ import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   getBoncAccessToken,
-  getEffectiveFrontendAuthMode,
   hasBoncHostLogoutCallback,
+  hasInMemoryBoncAccessToken,
   notifyBoncHostLogout,
   registerBoncAuthProvider,
   resetBoncAuthAdapterForTests,
-  setRuntimeAuthModeOverride,
+  setInMemoryBoncAccessToken,
   subscribeBoncHostLogout,
   validateHostLoginUrl,
 } from "../../frontend/src/lib/bonc-auth.ts";
@@ -21,10 +21,8 @@ import {
   getAdminSession,
   getPlatformCategories,
   getPublicPlatformCategories,
-  loginAdmin,
   logoutAdmin,
   runPlatformAdminSearch,
-  setCsrfErrorHandler,
   setForbiddenHandler,
   setUnauthorizedHandler,
 } from "../../frontend/src/lib/search-api.ts";
@@ -64,15 +62,13 @@ afterEach(() => {
   resetBoncAuthAdapterForTests();
   setUnauthorizedHandler(null);
   setForbiddenHandler(null);
-  setCsrfErrorHandler(null);
 });
 
-describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security", () => {
+describe("BONC-Only Frontend Authentication & Integrated Auth Security", () => {
   it("attaches in-memory BONC Bearer token on protected requests with credentials:omit and no CSRF header", async () => {
     registerBoncAuthProvider({
       getAccessToken: () => "bonc-access-token-in-memory",
     });
-    assert.equal(getEffectiveFrontendAuthMode(), "bonc");
     assert.equal(await getBoncAccessToken(), "bonc-access-token-in-memory");
 
     const calls = mockFetchSequence([
@@ -88,8 +84,6 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
           actor: "bonc-uuid-123",
           roles: ["Admin"],
           permissions: ["admin:categories:read", "admin:search:execute"],
-          csrf_token: null,
-          local_login_enabled: false,
         },
       },
       {
@@ -177,7 +171,7 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
     assert.equal(new Headers(calls[1].init.headers).get("Authorization"), "Bearer fresh-bonc-token");
   });
 
-  it("handles missing/expired token when refresh fails cleanly without falling back to local login", async () => {
+  it("handles missing/expired token when refresh fails cleanly", async () => {
     let unauthorizedCount = 0;
     setUnauthorizedHandler(() => {
       unauthorizedCount += 1;
@@ -198,16 +192,9 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
     assert.equal(unauthorizedCount, 1);
     assert.equal(calls.length, 1);
     assert.equal(new Headers(calls[0].init.headers).get("Authorization"), null);
-
-    // Independent local login MUST be refused in BONC mode with zero network call
-    await assert.rejects(
-      () => loginAdmin({ username: "ops", password: "secret" }),
-      (err: unknown) => err instanceof ApiError && err.status === 403,
-    );
-    assert.equal(calls.length, 1);
   });
 
-  it("handles 403 forbidden separately from 401 and switches to BONC mode on backend X-Auth-Mode header", async () => {
+  it("handles 403 Basic user rejection separately from 401 and clears in-memory token", async () => {
     let forbiddenMessage = "";
     let unauthorizedCount = 0;
     setForbiddenHandler((msg) => {
@@ -217,6 +204,7 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
       unauthorizedCount += 1;
     });
 
+    setInMemoryBoncAccessToken("basic-bonc-user-token");
     mockFetchSequence([
       {
         status: 403,
@@ -231,8 +219,7 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
     );
     assert.equal(forbiddenMessage, "Administrator access required");
     assert.equal(unauthorizedCount, 0);
-    // Backend signaled BONC mode -> frontend locks into BONC mode (no local login fallback)
-    assert.equal(getEffectiveFrontendAuthMode(), "bonc");
+    assert.equal(hasInMemoryBoncAccessToken(), false);
   });
 
   it("delegates logout to host BONC provider and responds to host-pushed logout notifications", async () => {
@@ -258,19 +245,78 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
       appNotifiedCount += 1;
     });
 
-    // Mock fetch to prove logoutAdmin does NOT call /api/admin/auth/logout in BONC mode
     const calls = mockFetchSequence([{ status: 500, body: { detail: "should not be called" } }]);
     const result = await logoutAdmin();
     assert.equal(result.hostHandled, true);
     assert.equal(hostLogoutInvoked, 1);
     assert.equal(calls.length, 0);
 
-    // Host-initiated logout notification reaches Search_Admin subscribers
     assert.ok(hostPushListener);
     hostPushListener!();
     notifyBoncHostLogout();
     assert.equal(appNotifiedCount, 2);
     unsub();
+  });
+
+  it("supports standalone in-memory BONC token auth and clears it on 401, 403, and logout", async () => {
+    assert.equal(setInMemoryBoncAccessToken("standalone-bonc-jwt-token"), true);
+    assert.equal(hasInMemoryBoncAccessToken(), true);
+    assert.equal(await getBoncAccessToken(), "standalone-bonc-jwt-token");
+
+    const calls = mockFetchSequence([
+      {
+        status: 200,
+        headers: { "X-Auth-Mode": "bonc_jwt" },
+        body: {
+          authenticated: true,
+          auth_method: "bonc_jwt",
+          auth_mode: "bonc_jwt",
+          user_id: "11111111-aaaa-4bbb-8ccc-000000000001",
+          username: "admin@bonc",
+          actor: "11111111-aaaa-4bbb-8ccc-000000000001",
+          roles: ["Admin"],
+        },
+      },
+      {
+        status: 403,
+        headers: { "X-Auth-Mode": "bonc_jwt" },
+        body: { detail: "Administrator access required" },
+      },
+      {
+        status: 401,
+        headers: { "X-Auth-Mode": "bonc_jwt" },
+        body: { detail: "Authentication required" },
+      },
+    ]);
+
+    const session = await getAdminSession();
+    assert.equal(session?.authenticated, true);
+    assert.equal(
+      new Headers(calls[0].init.headers).get("Authorization"),
+      "Bearer standalone-bonc-jwt-token",
+    );
+    assert.equal(calls[0].init.credentials, "omit");
+
+    // Logout clears in-memory BONC token without calling any backend logout route
+    const logoutRes = await logoutAdmin();
+    assert.equal(logoutRes.hostHandled, false);
+    assert.equal(hasInMemoryBoncAccessToken(), false);
+    assert.equal(await getBoncAccessToken(), null);
+    assert.equal(calls.length, 1);
+
+    // 403 (Basic user) clears in-memory BONC token
+    setInMemoryBoncAccessToken("basic-bonc-jwt-token");
+    await assert.rejects(
+      () => getAdminSession(),
+      (err: unknown) => err instanceof ApiError && err.status === 403,
+    );
+    assert.equal(hasInMemoryBoncAccessToken(), false);
+
+    // 401 (revoked/expired) clears in-memory BONC token
+    setInMemoryBoncAccessToken("revoked-bonc-jwt-token");
+    const unauth = await getAdminSession();
+    assert.equal(unauth, null);
+    assert.equal(hasInMemoryBoncAccessToken(), false);
   });
 
   it("validates optional hostLoginUrl and rejects unsafe schemes or token query params", () => {
@@ -282,7 +328,22 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
     assert.equal(validateHostLoginUrl("/login#auth=secret"), null);
   });
 
-  it("never uses browser storage, invented globals, window.parent, wildcard postMessage, or hardcoded tokens", () => {
+  it("renders BONC-only auth interface with zero local username/password form, storage, CSRF, or mode switches", () => {
+    const appSrc = fs.readFileSync(path.join(FRONTEND_SRC, "App.tsx"), "utf8");
+    // BONC auth UI & existing admin dashboard navigation remain intact
+    assert.equal(appSrc.includes("BONC AuthToken"), true);
+    assert.equal(appSrc.includes("Verify BONC Token"), true);
+    assert.equal(appSrc.includes("Administrator Access Required"), true);
+    assert.equal(appSrc.includes("System Health"), true);
+    assert.equal(appSrc.includes("Search Logs"), true);
+    assert.equal(appSrc.includes("Data Sources"), true);
+
+    // Zero legacy local username/password form or CSRF UI remains
+    assert.equal(appSrc.includes("Admin Username"), false);
+    assert.equal(appSrc.includes("current-password"), false);
+    assert.equal(appSrc.includes("loginAdmin"), false);
+    assert.equal(appSrc.includes("CSRF"), false);
+
     const filesToAudit = [
       path.join(FRONTEND_SRC, "lib", "bonc-auth.ts"),
       path.join(FRONTEND_SRC, "lib", "search-api.ts"),
@@ -290,7 +351,6 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
     ];
     for (const filePath of filesToAudit) {
       const src = fs.readFileSync(filePath, "utf8");
-      // Strip comments before checking forbidden browser storage / host-hack APIs
       const codeOnly = src
         .replace(/\/\*[\s\S]*?\*\//g, "")
         .replace(/\/\/.*$/gm, "");
@@ -300,10 +360,10 @@ describe("BONC Frontend Host Token Provider Adapter & Integrated Auth Security",
       assert.equal(codeOnly.includes("window.parent"), false, `${filePath} must not invent window.parent access`);
       assert.equal(codeOnly.includes("postMessage"), false, `${filePath} must not invent postMessage handshakes`);
       assert.equal(codeOnly.includes("__BONC_"), false, `${filePath} must not invent global window.__BONC_* vars`);
+      assert.equal(codeOnly.includes("VITE_AUTH_MODE"), false, `${filePath} must not check removed VITE_AUTH_MODE`);
+      assert.equal(codeOnly.includes("X-CSRF-Token"), false, `${filePath} must not send X-CSRF-Token`);
+      assert.equal(codeOnly.includes("/api/admin/auth/login"), false, `${filePath} must not call /api/admin/auth/login`);
+      assert.equal(codeOnly.includes("/api/admin/auth/logout"), false, `${filePath} must not call /api/admin/auth/logout`);
     }
-
-    // Confirm BONC mode overrides cleanly without leaking runtime state
-    setRuntimeAuthModeOverride("bonc");
-    assert.equal(getEffectiveFrontendAuthMode(), "bonc");
   });
 });

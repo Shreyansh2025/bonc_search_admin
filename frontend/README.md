@@ -18,7 +18,7 @@ Independent React 19 + TypeScript + Vite console (`frontend/`) serving the Gener
 ## Security & Boundary Guarantees
 
 - Browser communicates exclusively with Search Admin Backend (`/admin-api` proxied to `127.0.0.1:8004`).
-- Uses `credentials: "include"` for `HttpOnly` session cookies and keeps `X-CSRF-Token` strictly in JS memory.
+- Uses BONC Bearer tokens (`Authorization: Bearer <AuthToken>`) held strictly in JavaScript memory with `credentials: "omit"` — never writes tokens to `localStorage`, `sessionStorage`, or cookies, and offers no local username/password login form.
 - Zero backend tokens, SQL drivers, BrochureIQ imports, or legacy Catalog Thresholds UI.
 
 ## Scripts

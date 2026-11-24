@@ -1,6 +1,7 @@
 """Independent runtime configuration for the BONC Search Admin & General Search Platform."""
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Literal
@@ -22,6 +23,8 @@ _LOCAL_DEFAULT_ALLOWED_ORIGINS = (
     "http://127.0.0.1:4175",
     "http://localhost:4175",
 )
+
+SUPPORTED_APP_ENVS: tuple[str, ...] = ("local", "staging", "production")
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -75,58 +78,8 @@ def _validate_http_base_url(raw: str) -> str | None:
 
 
 def get_app_env() -> str:
+    """Return active runtime environment (``local``, ``staging``, or ``production``)."""
     return os.getenv("APP_ENV", "local").strip().lower() or "local"
-
-
-def get_admin_auth_mode() -> Literal["bonc_jwt", "local_session", "invalid"]:
-    """Resolve Search Admin authentication mode fail-closed.
-
-    Rules:
-    - Outside ``APP_ENV=local`` (e.g. ``staging`` / ``production``), BONC JWT
-      authentication (``bonc_jwt``) is the mandatory default, and
-      ``local_session`` is strictly disallowed (returns ``"invalid"`` so the
-      backend fails closed with HTTP 503 rather than activating local login).
-    - Inside ``APP_ENV=local``, ``SEARCH_ADMIN_AUTH_MODE`` may explicitly select
-      ``"bonc_jwt"`` or ``"local_session"`` (defaults to ``"local_session"``
-      during local transition). Unknown values always return ``"invalid"``.
-    """
-    app_env = get_app_env()
-    raw_mode = os.getenv("SEARCH_ADMIN_AUTH_MODE", "").strip().lower()
-
-    if app_env != "local":
-        if not raw_mode or raw_mode == "bonc_jwt":
-            return "bonc_jwt"
-        logger.error(
-            "Disallowed SEARCH_ADMIN_AUTH_MODE=%r for APP_ENV=%s; failing closed.",
-            raw_mode,
-            app_env,
-        )
-        return "invalid"
-
-    if not raw_mode or raw_mode == "local_session":
-        return "local_session"
-    if raw_mode == "bonc_jwt":
-        return "bonc_jwt"
-    logger.error(
-        "Unsupported SEARCH_ADMIN_AUTH_MODE=%r for APP_ENV=%s; failing closed.",
-        raw_mode,
-        app_env,
-    )
-    return "invalid"
-
-
-def is_local_session_auth_allowed() -> bool:
-    """True only in explicit local development mode when local_session is active."""
-    return get_app_env() == "local" and get_admin_auth_mode() == "local_session"
-
-
-def is_cli_service_token_enabled_in_bonc_mode() -> bool:
-    """Whether the separate narrow CLI/automation service token is opted in under BONC mode.
-
-    Disabled by default so human BONC authentication remains strictly isolated
-    from machine/CLI credentials.
-    """
-    return _bool_env("SEARCH_ADMIN_ALLOW_CLI_SERVICE_TOKEN", False)
 
 
 def is_api_docs_enabled() -> bool:
@@ -211,6 +164,75 @@ def resolve_allowed_origins() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# BONC .NET Admin Authentication Configuration (getUserDetail — Mandatory)
+# ---------------------------------------------------------------------------
+
+DEFAULT_BONC_AUTH_ADMIN_ROLES: tuple[str, ...] = ("Admin", "SuperAdmin")
+DEFAULT_BONC_AUTH_TIMEOUT_SECONDS = 5.0
+DEFAULT_BONC_AUTH_CACHE_SECONDS = 60.0
+
+
+def get_bonc_auth_verify_url() -> str | None:
+    """Return configured BONC .NET ``getUserDetail`` endpoint URL, or None if unset."""
+    raw = (os.getenv("BONC_AUTH_VERIFY_URL") or "").strip()
+    return raw or None
+
+
+def get_bonc_auth_admin_roles() -> tuple[str, ...]:
+    """Parse comma-separated ``BONC_AUTH_ADMIN_ROLES``.
+
+    Defaults to ``("Admin", "SuperAdmin")`` when unset. If explicitly set to
+    blank/whitespace, returns ``()`` so startup validation fails closed.
+    """
+    raw = os.getenv("BONC_AUTH_ADMIN_ROLES")
+    if raw is None:
+        return DEFAULT_BONC_AUTH_ADMIN_ROLES
+    roles: list[str] = []
+    seen_lower: set[str] = set()
+    for part in raw.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key not in seen_lower:
+            seen_lower.add(key)
+            roles.append(cleaned)
+    return tuple(roles)
+
+
+def get_bonc_auth_cache_seconds() -> float:
+    """Return TTL in seconds for caching accepted BONC tokens (``0`` disables cache)."""
+    raw = (os.getenv("BONC_AUTH_CACHE_SECONDS") or "").strip()
+    if not raw:
+        return DEFAULT_BONC_AUTH_CACHE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"BONC_AUTH_CACHE_SECONDS must be a non-negative number, not {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(
+            f"BONC_AUTH_CACHE_SECONDS must be greater than or equal to zero, not {raw!r}"
+        )
+    return value
+
+
+def get_bonc_auth_timeout_seconds() -> float:
+    """Return HTTP timeout in seconds for calls to BONC's ``getUserDetail`` endpoint."""
+    raw = (os.getenv("BONC_AUTH_TIMEOUT") or "").strip()
+    if not raw:
+        return DEFAULT_BONC_AUTH_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"BONC_AUTH_TIMEOUT must be a positive number, not {raw!r}") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"BONC_AUTH_TIMEOUT must be greater than zero, not {raw!r}")
+    return value
+
+
+# ---------------------------------------------------------------------------
 # General Search Platform SQL Server Configuration (searchai.* ONLY)
 # ---------------------------------------------------------------------------
 
@@ -253,29 +275,8 @@ def should_warmup_embedding_model_on_startup() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Isolated Admin-Local SQLite Auth Store Configuration
-# ---------------------------------------------------------------------------
-
-
-def get_admin_auth_db_url() -> str:
-    """Return isolated SQLite URL for Search Admin's local session and rate-limit store."""
-    explicit_url = os.getenv("SEARCH_ADMIN_AUTH_DB_URL", "").strip()
-    if explicit_url:
-        return explicit_url
-
-    raw_path = os.getenv("SEARCH_ADMIN_AUTH_DB_PATH", "./data/admin_auth.db").strip()
-    if raw_path == ":memory:":
-        return "sqlite:///:memory:"
-
-    path = Path(raw_path)
-    if not path.is_absolute():
-        path = (BACKEND_ROOT / path).resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return f"sqlite:///{path.as_posix()}"
-
-
-# ---------------------------------------------------------------------------
 # Optional Read-Only Production Observability Client (DISABLED BY DEFAULT)
+# Separate security boundary from Search Admin user authentication.
 # ---------------------------------------------------------------------------
 
 

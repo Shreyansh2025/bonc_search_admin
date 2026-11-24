@@ -1,17 +1,16 @@
 /**
- * BONC Host Authentication Token Provider Adapter (In-Memory Only).
+ * BONC Authentication Token Provider Adapter (In-Memory Only).
  *
  * Security & boundary guarantees:
+ * - BONC is the ONLY supported Search Admin user authentication system.
  * - BONC owns user login, access tokens, refresh tokens, refresh flows, and logout/revocation.
  * - Search_Admin NEVER stores access or refresh tokens in localStorage, sessionStorage, cookies,
  *   URL query parameters, build artifacts, or logs.
  * - Search_Admin NEVER invents an unverified global browser variable (e.g. window.__BONC_TOKEN__),
  *   arbitrary window.parent access, or wildcard postMessage origin.
- * - Until the BONC host application registers an approved in-memory token provider via
- *   `registerBoncAuthProvider(...)`, this adapter remains disabled / unconfigured.
+ * - Tokens are read either from a host-registered in-memory provider (`registerBoncAuthProvider`)
+ *   or from the standalone in-memory BONC AuthToken input (`setInMemoryBoncAccessToken`).
  */
-
-export type FrontendAuthMode = "bonc" | "local";
 
 export interface BoncAuthTokenProvider {
   /** Return the current BONC-issued access token from host memory (never stored by Search_Admin). */
@@ -30,11 +29,10 @@ export interface BoncAuthTokenProvider {
 }
 
 let registeredHostProvider: BoncAuthTokenProvider | null = null;
+let manualInMemoryToken: string | null = null;
 let unsubscribeFromHost: (() => void) | null = null;
-let runtimeModeOverride: FrontendAuthMode | null = null;
 
 const logoutListeners = new Set<() => void>();
-const modeListeners = new Set<(mode: FrontendAuthMode) => void>();
 
 function normalizeToken(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -67,59 +65,11 @@ export function validateHostLoginUrl(rawUrl: string | undefined): string | null 
   }
 }
 
-export function getConfiguredFrontendAuthMode(): FrontendAuthMode {
-  const env = typeof import.meta !== "undefined" ? import.meta.env : undefined;
-  const rawMode = (env?.VITE_AUTH_MODE || "").trim().toLowerCase();
-  if (rawMode === "bonc" || rawMode === "bonc_jwt") {
-    return "bonc";
-  }
-  if (rawMode === "local" || rawMode === "local_session") {
-    return "local";
-  }
-  // In production builds, default strictly to BONC host mode (never ship an independent
-  // production Search_Admin login screen silently). Local dev defaults to "local" during transition.
-  if (env?.PROD === true) {
-    return "bonc";
-  }
-  return "local";
-}
-
-export function getEffectiveFrontendAuthMode(): FrontendAuthMode {
-  if (runtimeModeOverride === "bonc") {
-    return "bonc";
-  }
-  if (registeredHostProvider !== null) {
-    return "bonc";
-  }
-  return runtimeModeOverride ?? getConfiguredFrontendAuthMode();
-}
-
-export function setRuntimeAuthModeOverride(mode: FrontendAuthMode | null): void {
-  const prev = getEffectiveFrontendAuthMode();
-  runtimeModeOverride = mode;
-  const next = getEffectiveFrontendAuthMode();
-  if (prev !== next) {
-    for (const listener of modeListeners) {
-      listener(next);
-    }
-  }
-}
-
-export function subscribeFrontendAuthMode(
-  listener: (mode: FrontendAuthMode) => void,
-): () => void {
-  modeListeners.add(listener);
-  return () => {
-    modeListeners.delete(listener);
-  };
-}
-
 /**
  * Register the approved BONC host in-memory token provider.
  * Pass `null` to unregister (primarily for teardown in automated tests).
  */
 export function registerBoncAuthProvider(provider: BoncAuthTokenProvider | null): void {
-  const prevMode = getEffectiveFrontendAuthMode();
   if (unsubscribeFromHost) {
     try {
       unsubscribeFromHost();
@@ -128,21 +78,50 @@ export function registerBoncAuthProvider(provider: BoncAuthTokenProvider | null)
     }
   }
   registeredHostProvider = provider;
+  if (provider !== null) {
+    // Host-managed token provider always supersedes any manual in-memory token.
+    manualInMemoryToken = null;
+  }
   if (provider?.subscribeLogout) {
     unsubscribeFromHost = provider.subscribeLogout(() => {
       notifyBoncHostLogout();
     });
   }
-  const nextMode = getEffectiveFrontendAuthMode();
-  if (prevMode !== nextMode) {
-    for (const listener of modeListeners) {
-      listener(nextMode);
-    }
-  }
 }
 
 export function getBoncAuthProvider(): BoncAuthTokenProvider | null {
   return registeredHostProvider;
+}
+
+export function hasExternalBoncHostProvider(): boolean {
+  return registeredHostProvider !== null;
+}
+
+/**
+ * Store a BONC Bearer AuthToken strictly in JS memory for standalone usage
+ * when Search Admin is not mounted inside a BONC host shell. Never persisted
+ * to browser storage, cookies, or URLs.
+ */
+export function setInMemoryBoncAccessToken(rawToken: string | null): boolean {
+  if (rawToken === null) {
+    manualInMemoryToken = null;
+    return false;
+  }
+  const normalized = normalizeToken(rawToken);
+  if (!normalized) {
+    manualInMemoryToken = null;
+    return false;
+  }
+  manualInMemoryToken = normalized;
+  return true;
+}
+
+export function clearInMemoryBoncAccessToken(): void {
+  manualInMemoryToken = null;
+}
+
+export function hasInMemoryBoncAccessToken(): boolean {
+  return manualInMemoryToken !== null;
 }
 
 export function hasBoncHostLogoutCallback(): boolean {
@@ -153,15 +132,17 @@ export function getBoncHostLoginUrl(): string | null {
   return validateHostLoginUrl(registeredHostProvider?.hostLoginUrl);
 }
 
-/** Obtain the current BONC access token strictly from the registered in-memory host provider. */
+/** Obtain the current BONC access token strictly from in-memory host provider or session memory. */
 export async function getBoncAccessToken(): Promise<string | null> {
-  if (!registeredHostProvider) return null;
-  try {
-    const token = await registeredHostProvider.getAccessToken();
-    return normalizeToken(token);
-  } catch {
-    return null;
+  if (registeredHostProvider) {
+    try {
+      const token = await registeredHostProvider.getAccessToken();
+      return normalizeToken(token);
+    } catch {
+      return null;
+    }
   }
+  return manualInMemoryToken;
 }
 
 /** Delegate access-token refresh to the host BONC application when supported. */
@@ -186,6 +167,7 @@ export async function invokeBoncHostLogout(): Promise<boolean> {
 
 /** Allow the host BONC application to notify Search_Admin immediately on user logout. */
 export function notifyBoncHostLogout(): void {
+  clearInMemoryBoncAccessToken();
   for (const listener of logoutListeners) {
     listener();
   }
@@ -198,10 +180,9 @@ export function subscribeBoncHostLogout(listener: () => void): () => void {
   };
 }
 
-/** Reset in-memory host adapter state (intended for automated tests). */
+/** Reset in-memory adapter state (intended for automated tests). */
 export function resetBoncAuthAdapterForTests(): void {
   registerBoncAuthProvider(null);
-  runtimeModeOverride = null;
+  manualInMemoryToken = null;
   logoutListeners.clear();
-  modeListeners.clear();
 }

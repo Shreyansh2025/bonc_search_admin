@@ -3,6 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  hasInMemoryBoncAccessToken,
+  resetBoncAuthAdapterForTests,
+  setInMemoryBoncAccessToken,
+} from "../../frontend/src/lib/bonc-auth.ts";
 import * as searchApi from "../../frontend/src/lib/search-api.ts";
 import {
   ADMIN_API_BASE,
@@ -11,7 +16,6 @@ import {
   clearClientSessionState,
   getAdminSession,
   getApiFailureMetrics,
-  getInMemoryCsrfToken,
   getKpiMetrics,
   getPlatformCategories,
   getPlatformCategoryHistory,
@@ -21,11 +25,10 @@ import {
   getSearchLogs,
   getSearchLogsByUser,
   getSystemHealth,
-  loginAdmin,
   logoutAdmin,
   rollbackPlatformCategory,
   runPlatformAdminSearch,
-  setCsrfErrorHandler,
+  setForbiddenHandler,
   setUnauthorizedHandler,
   syncPlatformCategory,
 } from "../../frontend/src/lib/search-api.ts";
@@ -59,11 +62,12 @@ function mockFetchSequence(
 afterEach(() => {
   globalThis.fetch = originalFetch;
   clearClientSessionState();
+  resetBoncAuthAdapterForTests();
   setUnauthorizedHandler(null);
-  setCsrfErrorHandler(null);
+  setForbiddenHandler(null);
 });
 
-describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF & boundary guards", () => {
+describe("Search Admin frontend API contracts, Generic Engine Testing, BONC Bearer auth & boundary guards", () => {
   it("defaults ADMIN_API_BASE to /admin-api (independent Search Admin Backend)", () => {
     assert.equal(ADMIN_API_BASE, "/admin-api");
   });
@@ -83,18 +87,19 @@ describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF
     );
   });
 
-  it("bootstraps session, stores CSRF in memory, sends credentials:include and X-CSRF-Token on writes/testing/logout", async () => {
+  it("verifies BONC session, sends Bearer token with credentials:omit on writes/testing, and clears memory on logout", async () => {
+    setInMemoryBoncAccessToken("bonc-demo-admin-jwt");
     const calls = mockFetchSequence([
       {
         status: 200,
         body: {
           authenticated: true,
-          auth_method: "session",
-          username: "ops.admin",
-          actor: "ops.admin",
-          roles: ["admin"],
-          expires_at_utc: "2026-11-23T20:00:00.000Z",
-          csrf_token: "csrf-mem-token-abc",
+          auth_method: "bonc_jwt",
+          auth_mode: "bonc_jwt",
+          user_id: "11111111-aaaa-4bbb-8ccc-000000000001",
+          username: "admin@bonc",
+          actor: "11111111-aaaa-4bbb-8ccc-000000000001",
+          roles: ["Admin"],
         },
       },
       {
@@ -149,17 +154,16 @@ describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF
           rollback_reason: "Restore v2",
         },
       },
-      {
-        status: 200,
-        body: { authenticated: false, status: "logged_out" },
-      },
     ]);
 
     const session = await getAdminSession();
     assert.equal(session?.authenticated, true);
-    assert.equal(getInMemoryCsrfToken(), "csrf-mem-token-abc");
     assert.equal(calls[0].url, `${ADMIN_API_BASE}/api/admin/auth/session`);
-    assert.equal(calls[0].init.credentials, "include");
+    assert.equal(calls[0].init.credentials, "omit");
+    assert.equal(
+      new Headers(calls[0].init.headers).get("Authorization"),
+      "Bearer bonc-demo-admin-jwt",
+    );
 
     const searchResp = await runPlatformAdminSearch({
       query: "python backend",
@@ -171,10 +175,10 @@ describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF
     assert.equal(searchResp.category, "people");
     assert.equal(calls[1].url, `${ADMIN_API_BASE}/api/admin/platform/search`);
     assert.equal(calls[1].init.method, "POST");
-    assert.equal(calls[1].init.credentials, "include");
+    assert.equal(calls[1].init.credentials, "omit");
     const searchHeaders = new Headers(calls[1].init.headers);
-    assert.equal(searchHeaders.get("X-CSRF-Token"), "csrf-mem-token-abc");
-    assert.equal(searchHeaders.get("Authorization"), null);
+    assert.equal(searchHeaders.get("Authorization"), "Bearer bonc-demo-admin-jwt");
+    assert.equal(searchHeaders.get("X-CSRF-Token"), null);
 
     const restored = await rollbackPlatformCategory({
       categoryId: "people",
@@ -185,48 +189,31 @@ describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF
     assert.equal(restored.config_version, 4);
     assert.equal(calls[2].url, `${ADMIN_API_BASE}/api/admin/platform/categories/people/rollback`);
     assert.equal(calls[2].init.method, "POST");
-    const rbHeaders = new Headers(calls[2].init.headers);
-    assert.equal(rbHeaders.get("X-CSRF-Token"), "csrf-mem-token-abc");
+    assert.equal(
+      new Headers(calls[2].init.headers).get("Authorization"),
+      "Bearer bonc-demo-admin-jwt",
+    );
 
     await logoutAdmin();
-    assert.equal(getInMemoryCsrfToken(), null);
-    const logoutHeaders = new Headers(calls[3].init.headers);
-    assert.equal(logoutHeaders.get("X-CSRF-Token"), "csrf-mem-token-abc");
+    assert.equal(hasInMemoryBoncAccessToken(), false);
+    assert.equal(calls.length, 3);
   });
 
-  it("handles 401 expiry and 403 CSRF errors properly", async () => {
+  it("handles 401 expiry and 403 forbidden responses properly", async () => {
     let unauthorizedCount = 0;
-    let csrfMessage = "";
+    let forbiddenMessage = "";
     setUnauthorizedHandler(() => {
       unauthorizedCount += 1;
     });
-    setCsrfErrorHandler((msg) => {
-      csrfMessage = msg;
+    setForbiddenHandler((msg) => {
+      forbiddenMessage = msg;
     });
 
+    setInMemoryBoncAccessToken("bonc-token");
     mockFetchSequence([
-      {
-        status: 200,
-        body: {
-          authenticated: true,
-          auth_method: "session",
-          username: "ops.admin",
-          actor: "ops.admin",
-          csrf_token: "csrf-initial",
-        },
-      },
-      {
-        status: 403,
-        body: { detail: "CSRF validation failed" },
-      },
-      {
-        status: 401,
-        body: { detail: "Authentication required" },
-      },
+      { status: 403, body: { detail: "Administrator access required" } },
+      { status: 401, body: { detail: "Authentication required" } },
     ]);
-
-    await loginAdmin({ username: "ops.admin", password: "secret" });
-    assert.equal(getInMemoryCsrfToken(), "csrf-initial");
 
     await assert.rejects(
       () =>
@@ -238,18 +225,21 @@ describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF
         }),
       (err: unknown) => err instanceof ApiError && err.status === 403,
     );
-    assert.equal(csrfMessage, "CSRF validation failed");
+    assert.equal(forbiddenMessage, "Administrator access required");
     assert.equal(unauthorizedCount, 0);
+    assert.equal(hasInMemoryBoncAccessToken(), false);
 
+    setInMemoryBoncAccessToken("expired-bonc-token");
     await assert.rejects(
       () => getSystemHealth(),
       (err: unknown) => err instanceof ApiError && err.status === 401,
     );
     assert.equal(unauthorizedCount, 1);
-    assert.equal(getInMemoryCsrfToken(), null);
+    assert.equal(hasInMemoryBoncAccessToken(), false);
   });
 
   it("wires Health, Logs, Metrics, Sources, Categories, History, Sync, and read-only Feedback routes cleanly", async () => {
+    setInMemoryBoncAccessToken("bonc-admin-token");
     const calls = mockFetchSequence([
       { status: 200, body: { status: "healthy", components: {} } },
       { status: 200, body: { filters: {}, pagination: {}, summary: {}, items: [] } },
@@ -317,11 +307,12 @@ describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF
     assert.equal(calls[10].url, `${ADMIN_API_BASE}/api/admin/platform/categories/people/feedback?limit=50`);
   });
 
-  it("enforces Stage 2 boundaries: Generic Engine Testing kept; legacy Catalog Thresholds, inline feedback writing, B2B playground & BrochureIQ removed", () => {
-    // Generic Engine Testing API is present (Decision #2)
+  it("enforces boundaries: Generic Engine Testing kept; legacy login, CSRF, Catalog Thresholds, inline feedback writing, B2B playground & BrochureIQ removed", () => {
     assert.equal("runPlatformAdminSearch" in searchApi, true);
 
-    // Retired / Excluded APIs (Decisions #1 and #2)
+    assert.equal("loginAdmin" in searchApi, false);
+    assert.equal("getInMemoryCsrfToken" in searchApi, false);
+    assert.equal("setCsrfErrorHandler" in searchApi, false);
     assert.equal("getSearchSettings" in searchApi, false);
     assert.equal("updateSearchSettings" in searchApi, false);
     assert.equal("getSearchSettingsHistory" in searchApi, false);

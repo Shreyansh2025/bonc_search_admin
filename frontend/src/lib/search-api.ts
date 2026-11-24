@@ -1,9 +1,8 @@
 import {
+  clearInMemoryBoncAccessToken,
   getBoncAccessToken,
-  getEffectiveFrontendAuthMode,
   invokeBoncHostLogout,
   refreshBoncAccessToken,
-  setRuntimeAuthModeOverride,
 } from "./bonc-auth.ts";
 
 const rawBase =
@@ -13,13 +12,8 @@ const rawBase =
   "/admin-api";
 export const ADMIN_API_BASE = rawBase.replace(/\/$/, "");
 
-const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-
-// Session CSRF token is held strictly in JS memory (local-dev cookie mode only) and never persisted to browser storage.
-let activeCsrfToken: string | null = null;
 let unauthorizedHandler: (() => void) | null = null;
 let forbiddenHandler: ((message: string) => void) | null = null;
-let csrfErrorHandler: ((message: string) => void) | null = null;
 
 export class ApiError extends Error {
   status: number;
@@ -33,16 +27,14 @@ export class ApiError extends Error {
 
 export interface AdminSessionInfo {
   authenticated: boolean;
-  auth_method: "session" | "bearer" | "jwt" | "bonc_jwt" | string;
-  auth_mode?: "bonc_jwt" | "local_session" | string;
+  auth_method: "bonc_jwt" | string;
+  auth_mode?: "bonc_jwt" | string;
   user_id?: string | null;
   username: string;
   actor: string;
   roles?: string[];
   permissions?: string[];
   expires_at_utc?: string | null;
-  csrf_token?: string | null;
-  local_login_enabled?: boolean;
 }
 
 export interface PublicPlatformCategorySummary {
@@ -59,16 +51,8 @@ export function setForbiddenHandler(handler: ((message: string) => void) | null)
   forbiddenHandler = handler;
 }
 
-export function setCsrfErrorHandler(handler: ((message: string) => void) | null): void {
-  csrfErrorHandler = handler;
-}
-
 export function clearClientSessionState(): void {
-  activeCsrfToken = null;
-}
-
-export function getInMemoryCsrfToken(): string | null {
-  return activeCsrfToken;
+  clearInMemoryBoncAccessToken();
 }
 
 export function buildQueryString(
@@ -91,21 +75,12 @@ export function buildQueryString(
   return encoded ? `?${encoded}` : "";
 }
 
-function observeBackendAuthMode(response: Response): void {
-  const headerMode = (response.headers.get("X-Auth-Mode") || "").trim().toLowerCase();
-  if (headerMode === "bonc_jwt" || headerMode === "invalid") {
-    activeCsrfToken = null;
-    setRuntimeAuthModeOverride("bonc");
-  }
-}
-
 async function adminFetch(
   path: string,
   init: RequestInit = {},
   options: { notifyOnUnauthorized?: boolean; allowRefreshRetry?: boolean } = {},
 ): Promise<Response> {
   const method = (init.method || "GET").toUpperCase();
-  const isBoncMode = getEffectiveFrontendAuthMode() === "bonc";
 
   const execute = async (overrideBearerToken?: string | null): Promise<Response> => {
     const headers = new Headers(init.headers);
@@ -113,57 +88,36 @@ async function adminFetch(
       headers.set("Accept", "application/json");
     }
 
-    if (isBoncMode) {
-      // BONC mode uses stateless Bearer tokens supplied strictly in-memory by the host.
-      // Never attach cookie CSRF tokens or send ambient local session cookies.
-      headers.delete("X-CSRF-Token");
-      const token =
-        overrideBearerToken !== undefined
-          ? overrideBearerToken
-          : await getBoncAccessToken();
-      if (token) {
-        headers.set("Authorization", `Bearer ${token}`);
-      } else {
-        headers.delete("Authorization");
-      }
-      return fetch(`${ADMIN_API_BASE}${path}`, {
-        ...init,
-        method,
-        headers,
-        credentials: "omit",
-      });
-    }
-
-    // Explicit local-development cookie session mode (transition only).
-    if (!SAFE_METHODS.has(method) && activeCsrfToken) {
-      headers.set("X-CSRF-Token", activeCsrfToken);
+    // BONC JWT mode uses stateless Bearer tokens held strictly in memory.
+    const token =
+      overrideBearerToken !== undefined
+        ? overrideBearerToken
+        : await getBoncAccessToken();
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    } else {
+      headers.delete("Authorization");
     }
     return fetch(`${ADMIN_API_BASE}${path}`, {
       ...init,
       method,
       headers,
-      credentials: "include",
+      credentials: "omit",
     });
   };
 
   let response = await execute();
-  observeBackendAuthMode(response);
 
-  // When BONC access token expires (401), delegate refresh ONCE to the host BONC application.
-  if (
-    response.status === 401 &&
-    isBoncMode &&
-    options.allowRefreshRetry !== false
-  ) {
+  // When a BONC access token expires (401), delegate refresh ONCE to the host BONC application.
+  if (response.status === 401 && options.allowRefreshRetry !== false) {
     const refreshedToken = await refreshBoncAccessToken();
     if (refreshedToken) {
       response = await execute(refreshedToken);
-      observeBackendAuthMode(response);
     }
   }
 
   if (response.status === 401) {
-    activeCsrfToken = null;
+    clearInMemoryBoncAccessToken();
     if (options.notifyOnUnauthorized !== false) {
       unauthorizedHandler?.();
     }
@@ -191,11 +145,8 @@ async function readJson<T>(response: Response, allowStatuses: number[] = []): Pr
           ? payload.message
           : `Request failed with HTTP ${response.status}.`;
     if (response.status === 403) {
-      if (message.toLowerCase().includes("csrf")) {
-        csrfErrorHandler?.(message);
-      } else {
-        forbiddenHandler?.(message);
-      }
+      clearInMemoryBoncAccessToken();
+      forbiddenHandler?.(message);
     }
     throw new ApiError(message, response.status);
   }
@@ -216,7 +167,7 @@ export async function getPublicPlatformCategories(): Promise<PublicPlatformCateg
 }
 
 // ---------------------------------------------------------------------------
-// Admin Authentication (BONC Host Bearer Token or Explicit Local-Dev Session)
+// BONC Admin Authentication (In-Memory Bearer AuthToken Only)
 // ---------------------------------------------------------------------------
 
 export async function getAdminSession(): Promise<AdminSessionInfo | null> {
@@ -226,65 +177,16 @@ export async function getAdminSession(): Promise<AdminSessionInfo | null> {
     { notifyOnUnauthorized: false },
   );
   if (response.status === 401) {
-    activeCsrfToken = null;
+    clearInMemoryBoncAccessToken();
     return null;
   }
-  const session = await readJson<AdminSessionInfo>(response);
-  if (session.auth_mode === "bonc_jwt" || session.local_login_enabled === false) {
-    activeCsrfToken = null;
-    setRuntimeAuthModeOverride("bonc");
-  } else {
-    activeCsrfToken = session.csrf_token || null;
-  }
-  return session;
-}
-
-export async function loginAdmin(input: {
-  username: string;
-  password: string;
-}): Promise<AdminSessionInfo> {
-  if (getEffectiveFrontendAuthMode() === "bonc") {
-    throw new ApiError(
-      "Independent Search Admin login is disabled in BONC mode. Sign in through BONC.",
-      403,
-    );
-  }
-  const response = await adminFetch(
-    "/api/admin/auth/login",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username: input.username.trim(),
-        password: input.password,
-      }),
-    },
-    { notifyOnUnauthorized: false },
-  );
-  const session = await readJson<AdminSessionInfo>(response);
-  activeCsrfToken = session.csrf_token || null;
-  return session;
+  return readJson<AdminSessionInfo>(response);
 }
 
 export async function logoutAdmin(): Promise<{ hostHandled: boolean }> {
-  if (getEffectiveFrontendAuthMode() === "bonc") {
-    activeCsrfToken = null;
-    const hostHandled = await invokeBoncHostLogout();
-    return { hostHandled };
-  }
-  try {
-    const response = await adminFetch(
-      "/api/admin/auth/logout",
-      { method: "POST" },
-      { notifyOnUnauthorized: false },
-    );
-    if (response.status !== 401) {
-      await readJson<{ authenticated: boolean; status: string }>(response);
-    }
-  } finally {
-    activeCsrfToken = null;
-  }
-  return { hostHandled: false };
+  clearInMemoryBoncAccessToken();
+  const hostHandled = await invokeBoncHostLogout();
+  return { hostHandled };
 }
 
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ from app.config import (
     resolve_allowed_origins,
     should_warmup_embedding_model_on_startup,
 )
-from app.db import auth_db, platform_db
+from app.db import platform_db
 from app.logger import logger
 from app.repositories import observability_store
 from app.routes.admin.observability import router as admin_observability_router
@@ -106,11 +106,10 @@ def create_app(
     connect_platform_database: bool = True,
 ) -> FastAPI:
     """Construct the independent General Search Platform & Search Admin FastAPI app."""
+    admin_auth.validate_startup_auth_config()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        if admin_auth.get_auth_provider().supports_local_login():
-            auth_db.init_auth_db()
         if getattr(application.state, "production_search_client", None) is None:
             application.state.production_search_client = (
                 production_search_client or ProductionSearchClient()
@@ -185,7 +184,6 @@ def create_app(
     application.state.initialization_task = None
 
     allowed_origins = resolve_allowed_origins()
-    allow_credentials = bool(allowed_origins) and "*" not in allowed_origins
     application.add_middleware(
         _HeadMatchesGetPolicyMiddleware,
         fastapi_app=application,
@@ -193,13 +191,12 @@ def create_app(
     application.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
-        allow_credentials=allow_credentials,
+        allow_credentials=False,
         allow_methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=[
             "Accept",
             "Authorization",
             "Content-Type",
-            "X-CSRF-Token",
             "X-Request-Id",
             "X-Correlation-Id",
         ],
