@@ -1,0 +1,25 @@
+{
+  "name": "bonc-search-admin-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --config vite.config.ts",
+    "build": "tsc -p tsconfig.json --noEmit && vite build --config vite.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "preview": "vite preview --config vite.config.ts",
+    "test": "node --experimental-strip-types --test ../tests/frontend/search-api.contract.test.ts ../tests/frontend/bonc-auth.integration.test.ts ../tests/frontend/platform-search-results.test.ts ../tests/frontend/engine-dropdown-switching.test.ts"
+  },
+  "dependencies": {
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.3",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.2"
+  }
+}

@@ -1,0 +1,366 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { afterEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import * as searchApi from "../../frontend/src/lib/search-api.ts";
+import {
+  ADMIN_API_BASE,
+  ApiError,
+  buildQueryString,
+  clearClientSessionState,
+  getAdminSession,
+  getApiFailureMetrics,
+  getInMemoryCsrfToken,
+  getKpiMetrics,
+  getPlatformCategories,
+  getPlatformCategoryHistory,
+  getPlatformFeedback,
+  getPlatformSourceProfiles,
+  getRelevanceMetrics,
+  getSearchLogs,
+  getSearchLogsByUser,
+  getSystemHealth,
+  loginAdmin,
+  logoutAdmin,
+  rollbackPlatformCategory,
+  runPlatformAdminSearch,
+  setCsrfErrorHandler,
+  setUnauthorizedHandler,
+  syncPlatformCategory,
+} from "../../frontend/src/lib/search-api.ts";
+
+interface RecordedCall {
+  url: string;
+  init: RequestInit;
+}
+
+const originalFetch = globalThis.fetch;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const FRONTEND_SRC = path.resolve(__dirname, "../../frontend/src");
+
+function mockFetchSequence(
+  responses: Array<{ status: number; body: unknown }>,
+): RecordedCall[] {
+  const calls: RecordedCall[] = [];
+  let index = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    calls.push({ url: String(input), init });
+    const next = responses[Math.min(index, responses.length - 1)];
+    index += 1;
+    return new Response(JSON.stringify(next.body), {
+      status: next.status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+  return calls;
+}
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  clearClientSessionState();
+  setUnauthorizedHandler(null);
+  setCsrfErrorHandler(null);
+});
+
+describe("Search Admin frontend API contracts, Generic Engine Testing, auth/CSRF & boundary guards", () => {
+  it("defaults ADMIN_API_BASE to /admin-api (independent Search Admin Backend)", () => {
+    assert.equal(ADMIN_API_BASE, "/admin-api");
+  });
+
+  it("builds clean query strings omitting empty/false values", () => {
+    assert.equal(
+      buildQueryString({
+        page: 2,
+        page_size: 25,
+        category: " people ",
+        query: "",
+        zero_results_only: true,
+        failed_only: false,
+        status_code: 403,
+      }),
+      "?page=2&page_size=25&category=people&zero_results_only=true&status_code=403",
+    );
+  });
+
+  it("bootstraps session, stores CSRF in memory, sends credentials:include and X-CSRF-Token on writes/testing/logout", async () => {
+    const calls = mockFetchSequence([
+      {
+        status: 200,
+        body: {
+          authenticated: true,
+          auth_method: "session",
+          username: "ops.admin",
+          actor: "ops.admin",
+          roles: ["admin"],
+          expires_at_utc: "2026-11-23T20:00:00.000Z",
+          csrf_token: "csrf-mem-token-abc",
+        },
+      },
+      {
+        status: 200,
+        body: {
+          query: "python backend",
+          category: "people",
+          query_understanding: {
+            normalised_query: "python backend",
+            query_type: "free_text",
+            field_hints: {},
+            matched_aliases: {},
+            matched_values: {},
+            matched_fields: {},
+            constraints: [],
+            lexical_query: "python backend",
+            expanded_lexical_query: "python backend",
+            synonym_expansions: [],
+            unmatched_tokens: [],
+            explanation: "Free text query",
+          },
+          query_plan: {
+            query_type: "free_text",
+            matched_aliases: {},
+            matched_values: {},
+            constraints: [],
+            unmatched_tokens: [],
+            lexical_query: "python backend",
+            expanded_lexical_query: "python backend",
+            synonym_expansions: [],
+            semantic_query: "python backend",
+            filters_applied: false,
+            explanation: "Free text query",
+          },
+          data: [],
+          total_count: 0,
+          page: 1,
+          page_size: 10,
+          config_version: 2,
+          index_version: 3,
+        },
+      },
+      {
+        status: 200,
+        body: {
+          config: { category_id: "people", display_name: "People" },
+          status: "active",
+          config_version: 4,
+          index_version: 5,
+          rolled_back_from_version: 2,
+          previous_config_version: 3,
+          rollback_reason: "Restore v2",
+        },
+      },
+      {
+        status: 200,
+        body: { authenticated: false, status: "logged_out" },
+      },
+    ]);
+
+    const session = await getAdminSession();
+    assert.equal(session?.authenticated, true);
+    assert.equal(getInMemoryCsrfToken(), "csrf-mem-token-abc");
+    assert.equal(calls[0].url, `${ADMIN_API_BASE}/api/admin/auth/session`);
+    assert.equal(calls[0].init.credentials, "include");
+
+    const searchResp = await runPlatformAdminSearch({
+      query: "python backend",
+      category: "people",
+      page: 1,
+      pageSize: 10,
+      filters: [{ field: "location", operator: "eq", value: "Indore" }],
+    });
+    assert.equal(searchResp.category, "people");
+    assert.equal(calls[1].url, `${ADMIN_API_BASE}/api/admin/platform/search`);
+    assert.equal(calls[1].init.method, "POST");
+    assert.equal(calls[1].init.credentials, "include");
+    const searchHeaders = new Headers(calls[1].init.headers);
+    assert.equal(searchHeaders.get("X-CSRF-Token"), "csrf-mem-token-abc");
+    assert.equal(searchHeaders.get("Authorization"), null);
+
+    const restored = await rollbackPlatformCategory({
+      categoryId: "people",
+      targetVersion: 2,
+      expectedVersion: 3,
+      reason: "Restore v2",
+    });
+    assert.equal(restored.config_version, 4);
+    assert.equal(calls[2].url, `${ADMIN_API_BASE}/api/admin/platform/categories/people/rollback`);
+    assert.equal(calls[2].init.method, "POST");
+    const rbHeaders = new Headers(calls[2].init.headers);
+    assert.equal(rbHeaders.get("X-CSRF-Token"), "csrf-mem-token-abc");
+
+    await logoutAdmin();
+    assert.equal(getInMemoryCsrfToken(), null);
+    const logoutHeaders = new Headers(calls[3].init.headers);
+    assert.equal(logoutHeaders.get("X-CSRF-Token"), "csrf-mem-token-abc");
+  });
+
+  it("handles 401 expiry and 403 CSRF errors properly", async () => {
+    let unauthorizedCount = 0;
+    let csrfMessage = "";
+    setUnauthorizedHandler(() => {
+      unauthorizedCount += 1;
+    });
+    setCsrfErrorHandler((msg) => {
+      csrfMessage = msg;
+    });
+
+    mockFetchSequence([
+      {
+        status: 200,
+        body: {
+          authenticated: true,
+          auth_method: "session",
+          username: "ops.admin",
+          actor: "ops.admin",
+          csrf_token: "csrf-initial",
+        },
+      },
+      {
+        status: 403,
+        body: { detail: "CSRF validation failed" },
+      },
+      {
+        status: 401,
+        body: { detail: "Authentication required" },
+      },
+    ]);
+
+    await loginAdmin({ username: "ops.admin", password: "secret" });
+    assert.equal(getInMemoryCsrfToken(), "csrf-initial");
+
+    await assert.rejects(
+      () =>
+        rollbackPlatformCategory({
+          categoryId: "people",
+          targetVersion: 1,
+          expectedVersion: 2,
+          reason: "test",
+        }),
+      (err: unknown) => err instanceof ApiError && err.status === 403,
+    );
+    assert.equal(csrfMessage, "CSRF validation failed");
+    assert.equal(unauthorizedCount, 0);
+
+    await assert.rejects(
+      () => getSystemHealth(),
+      (err: unknown) => err instanceof ApiError && err.status === 401,
+    );
+    assert.equal(unauthorizedCount, 1);
+    assert.equal(getInMemoryCsrfToken(), null);
+  });
+
+  it("wires Health, Logs, Metrics, Sources, Categories, History, Sync, and read-only Feedback routes cleanly", async () => {
+    const calls = mockFetchSequence([
+      { status: 200, body: { status: "healthy", components: {} } },
+      { status: 200, body: { filters: {}, pagination: {}, summary: {}, items: [] } },
+      { status: 200, body: { filters: {}, pagination: {}, summary: {}, items: [] } },
+      { status: 200, body: { window: {}, search_kpis: {}, api_monitoring: {}, relevance_feedback: {} } },
+      { status: 200, body: { window: {}, total_api_requests: 0 } },
+      { status: 200, body: { window: {}, summary: {}, category_breakdown: [], recent_negative_examples: [] } },
+      { status: 200, body: { items: [{ profile_id: "BONC_DEV", connection_env: "SEARCH_SOURCE_BONC_DEV" }] } },
+      { status: 200, body: [] },
+      { status: 200, body: { items: [] } },
+      { status: 200, body: { status: "ok", category_id: "people", documents_synced: 10 } },
+      { status: 200, body: { total_count: 0, relevant_count: 0, not_relevant_count: 0, items: [] } },
+    ]);
+
+    await getSystemHealth(12);
+    assert.equal(calls[0].url, `${ADMIN_API_BASE}/api/admin/platform/system-health?recent_failures_limit=12`);
+
+    await getSearchLogs({
+      page: 2,
+      page_size: 50,
+      start_utc: "2026-11-01",
+      end_utc: "2026-11-22",
+      user_id: "alice",
+      identity_type: "authenticated",
+      category: "people",
+      query: "python",
+      status_code: 200,
+      status_class: "2xx",
+      outcome: "zero_results",
+      zero_results_only: true,
+      failed_only: false,
+      surface: "public",
+    });
+    assert.equal(
+      calls[1].url,
+      `${ADMIN_API_BASE}/api/admin/platform/search-logs?page=2&page_size=50&start_utc=2026-11-01&end_utc=2026-11-22&user_id=alice&identity_type=authenticated&category=people&query=python&status_code=200&status_class=2xx&outcome=zero_results&zero_results_only=true&surface=public`,
+    );
+
+    await getSearchLogsByUser({ page: 1, page_size: 25, category: "jobs", user_id: "bob" });
+    assert.equal(calls[2].url, `${ADMIN_API_BASE}/api/admin/platform/search-logs/users?page=1&page_size=25&category=jobs&user_id=bob`);
+
+    await getKpiMetrics({ category: "articles", top_endpoints_limit: 10, recent_failures_limit: 20 });
+    assert.equal(calls[3].url, `${ADMIN_API_BASE}/api/admin/platform/metrics/kpis?category=articles&top_endpoints_limit=10&recent_failures_limit=20`);
+
+    await getApiFailureMetrics({ endpoint: "/api/platform/search" });
+    assert.equal(calls[4].url, `${ADMIN_API_BASE}/api/admin/platform/metrics/api-failures?endpoint=%2Fapi%2Fplatform%2Fsearch`);
+
+    await getRelevanceMetrics({ category: "people", recent_negative_limit: 15 });
+    assert.equal(calls[5].url, `${ADMIN_API_BASE}/api/admin/platform/metrics/relevance?category=people&recent_negative_limit=15`);
+
+    const profiles = await getPlatformSourceProfiles();
+    assert.equal(profiles.length, 1);
+    assert.equal(calls[6].url, `${ADMIN_API_BASE}/api/admin/platform/sources`);
+
+    await getPlatformCategories();
+    assert.equal(calls[7].url, `${ADMIN_API_BASE}/api/admin/platform/categories`);
+
+    await getPlatformCategoryHistory("people");
+    assert.equal(calls[8].url, `${ADMIN_API_BASE}/api/admin/platform/categories/people/history`);
+
+    await syncPlatformCategory("people");
+    assert.equal(calls[9].url, `${ADMIN_API_BASE}/api/admin/platform/categories/people/sync`);
+
+    await getPlatformFeedback("people", 50);
+    assert.equal(calls[10].url, `${ADMIN_API_BASE}/api/admin/platform/categories/people/feedback?limit=50`);
+  });
+
+  it("enforces Stage 2 boundaries: Generic Engine Testing kept; legacy Catalog Thresholds, inline feedback writing, B2B playground & BrochureIQ removed", () => {
+    // Generic Engine Testing API is present (Decision #2)
+    assert.equal("runPlatformAdminSearch" in searchApi, true);
+
+    // Retired / Excluded APIs (Decisions #1 and #2)
+    assert.equal("getSearchSettings" in searchApi, false);
+    assert.equal("updateSearchSettings" in searchApi, false);
+    assert.equal("getSearchSettingsHistory" in searchApi, false);
+    assert.equal("recordPlatformFeedback" in searchApi, false);
+    assert.equal("runSearch" in searchApi, false);
+    assert.equal("getReadiness" in searchApi, false);
+
+    const filesToCheck = [
+      path.join(FRONTEND_SRC, "App.tsx"),
+      path.join(FRONTEND_SRC, "components", "platform-panel.tsx"),
+      path.join(FRONTEND_SRC, "lib", "search-api.ts"),
+      path.join(FRONTEND_SRC, "components", "search-logs-panel.tsx"),
+      path.join(FRONTEND_SRC, "components", "system-health-panel.tsx"),
+    ];
+
+    const platformPanelContent = fs.readFileSync(
+      path.join(FRONTEND_SRC, "components", "platform-panel.tsx"),
+      "utf8",
+    );
+    assert.equal(
+      platformPanelContent.includes("Generic Search Engine Testing"),
+      true,
+      "platform-panel.tsx must include Generic Search Engine Testing UI",
+    );
+
+    for (const filePath of filesToCheck) {
+      const content = fs.readFileSync(filePath, "utf8");
+      assert.equal(content.includes("Catalog Thresholds"), false, `${filePath} must not contain Catalog Thresholds`);
+      assert.equal(content.includes("/api/admin/search-settings"), false, `${filePath} must not call legacy search-settings`);
+      assert.equal(content.includes("B2B Catalog Playground"), false, `${filePath} must not contain B2B Catalog Playground`);
+      assert.equal(content.includes("Mark Relevant"), false, `${filePath} must not contain inline Mark Relevant controls`);
+      assert.equal(content.includes("BrochureIQ Products"), false, `${filePath} must not display BrochureIQ Products`);
+      assert.equal(content.includes("localProducts"), false, `${filePath} must not reference localProducts`);
+      assert.equal(content.includes("SEARCH_AI_ADMIN_API_TOKEN"), false, `${filePath} must not reference backend tokens`);
+      assert.equal(content.includes("SEARCH_ADMIN_SERVICE_TOKEN"), false, `${filePath} must not reference backend tokens`);
+      assert.equal(content.includes("SEARCH_ADMIN_API_TOKEN"), false, `${filePath} must not reference backend tokens`);
+      assert.equal(content.includes("pyodbc"), false, `${filePath} must not reference SQL Server drivers`);
+      assert.equal(content.includes("react-frontend"), false, `${filePath} must not import BrochureIQ frontend`);
+      assert.equal(content.includes("@workspace/"), false, `${filePath} must not import monorepo workspace libs`);
+    }
+  });
+});

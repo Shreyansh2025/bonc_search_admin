@@ -1,0 +1,34 @@
+# Reference Nginx configuration for independent deployment of the BONC General Search Platform
+# & Search Admin Console.
+# DO NOT apply to staging/production Nginx until approved by infrastructure owners.
+
+# 1. Static Search Admin Frontend bundle (built with VITE_BASE_PATH=/search-admin/
+#    and VITE_ADMIN_API_BASE_URL=/search-admin-api)
+location /search-admin/ {
+    alias /opt/bonc-search-admin/frontend/dist/;
+    index index.html;
+    try_files $uri $uri/ /search-admin/index.html;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+}
+
+# 2. Reverse proxy to General Search Platform & Search Admin FastAPI Backend (loopback port 8004).
+#    Strips the /search-admin-api/ prefix before forwarding.
+#    Never expose port 8004 directly to the public internet.
+location /search-admin-api/ {
+    proxy_pass http://127.0.0.1:8004/;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Request-Id $request_id;
+
+    # Allow long-running SQL source sync & FAISS index builds without premature timeouts.
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 130s;
+    proxy_send_timeout 30s;
+}

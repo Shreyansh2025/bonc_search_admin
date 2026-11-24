@@ -1,0 +1,26 @@
+# Reference systemd unit for independent deployment of the BONC General Search Platform
+# & Search Admin Backend.
+# DO NOT install or activate on production/staging until cutover review is approved.
+# Note: Completely independent of the retired split Search AI microservice (port 8002).
+
+[Unit]
+Description=BONC General Search Platform & Search Admin Backend (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bonc-admin
+Group=bonc-admin
+WorkingDirectory=/opt/bonc-search-admin/backend
+EnvironmentFile=/etc/bonc-search-admin/backend.env
+ExecStart=/opt/bonc-search-admin/backend/.venv/bin/gunicorn -c gunicorn.conf.py app.main:app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bonc-search-admin
+
+[Install]
+WantedBy=multi-user.target

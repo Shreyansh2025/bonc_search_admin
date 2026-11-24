@@ -1,0 +1,17 @@
+# Independent runtime dependencies for the BONC General Search Platform & Search Admin Backend.
+# Strictly excludes BrochureIQ OCR/PDF/image packages (PyMuPDF, pytesseract, pillow, rembg,
+# onnxruntime, openpyxl, python-multipart).
+fastapi==0.115.6
+uvicorn==0.34.0
+gunicorn==23.0.0
+pydantic==2.12.5
+python-dotenv==1.0.1
+httpx==0.28.1
+SQLAlchemy==2.0.51
+pyodbc==5.3.0
+numpy==2.4.6
+faiss-cpu==1.9.0.post1
+sentence-transformers==3.3.1
+pyspellchecker==0.9.1
+# Shared BONC auth helper package (pinned to verified commit; local dev may use editable install)
+bonc-auth[fastapi] @ git+https://github.com/Shreyansh2025/bonc-auth.git@1a314e3e6db9959bc9a1f47db7a15d8bded155e7
